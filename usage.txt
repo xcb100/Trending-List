@@ -1,0 +1,22 @@
+创建实时榜单示例：
+
+curl.exe -X POST "http://localhost:8080/leaderboard" -H "Content-Type: application/json" -d "{\"id\":\"top_videos\",\"expression\":\"views * 1 + likes * 10\",\"schema\":{\"views\":0,\"likes\":0},\"refresh_policy\":\"realtime\"}"
+
+创建定时榜单示例：
+
+curl.exe -X POST "http://localhost:8080/leaderboard" -H "Content-Type: application/json" -d "{\"id\":\"hot_articles\",\"expression\":\"views * 0.5 + likes * 5\",\"schema\":{\"views\":0,\"likes\":0},\"refresh_policy\":\"scheduled\",\"cron_spec\":\"@every 10s\"}"
+
+更新榜单条目示例：
+
+curl.exe -X POST "http://localhost:8080/leaderboard/top_videos/item" -H "Content-Type: application/json" -d "{\"item_id\":\"video_123\",\"data\":{\"views\":1000,\"likes\":50}}"
+
+如果榜单是 realtime 模式，写入后会立刻更新分数。
+如果榜单是 scheduled 模式，写入后只会标记为 dirty，等待 cron 或手动重算。
+
+手动重算榜单示例：
+
+curl.exe -X POST "http://localhost:8080/leaderboard/hot_articles/recompute"
+
+查看榜单前 10 名：
+
+curl.exe "http://localhost:8080/leaderboard/top_videos?n=10"
