@@ -3,6 +3,7 @@ package api
 import (
 	"awesomeProject/internal/core"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -85,9 +86,13 @@ func UpdateItemHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lb := core.GetLeaderboard(r.Context(), lbID)
-	if lb == nil {
-		sendError(w, http.StatusNotFound, "未找到排行榜")
+	lb, err := core.GetLeaderboard(r.Context(), lbID)
+	if err != nil {
+		if errors.Is(err, core.ErrLeaderboardNotFound) {
+			sendError(w, http.StatusNotFound, "未找到排行榜")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "读取排行榜失败")
 		return
 	}
 
@@ -131,9 +136,13 @@ func GetLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lb := core.GetLeaderboard(r.Context(), lbID)
-	if lb == nil {
-		sendError(w, http.StatusNotFound, "未找到排行榜")
+	lb, err := core.GetLeaderboard(r.Context(), lbID)
+	if err != nil {
+		if errors.Is(err, core.ErrLeaderboardNotFound) {
+			sendError(w, http.StatusNotFound, "未找到排行榜")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "读取排行榜失败")
 		return
 	}
 
@@ -165,9 +174,13 @@ func ScheduleUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lb := core.GetLeaderboard(r.Context(), lbID)
-	if lb == nil {
-		sendError(w, http.StatusNotFound, "未找到排行榜")
+	lb, err := core.GetLeaderboard(r.Context(), lbID)
+	if err != nil {
+		if errors.Is(err, core.ErrLeaderboardNotFound) {
+			sendError(w, http.StatusNotFound, "未找到排行榜")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "读取排行榜失败")
 		return
 	}
 
@@ -208,9 +221,13 @@ func RecomputeLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lb := core.GetLeaderboard(r.Context(), lbID)
-	if lb == nil {
-		sendError(w, http.StatusNotFound, "未找到排行榜")
+	lb, err := core.GetLeaderboard(r.Context(), lbID)
+	if err != nil {
+		if errors.Is(err, core.ErrLeaderboardNotFound) {
+			sendError(w, http.StatusNotFound, "未找到排行榜")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "读取排行榜失败")
 		return
 	}
 

@@ -12,6 +12,7 @@ import (
 	"awesomeProject/internal/api"
 	"awesomeProject/internal/core"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -35,12 +36,13 @@ func main() {
 	redisRepo := core.NewRedisRepository(rdb)
 	core.SetDefaultRepo(redisRepo)
 
+	// ---------------- 配置业务 API 路由 (端口 8080) ----------------
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /leaderboard", api.CreateLeaderboardHandler)
-	mux.HandleFunc("POST /leaderboard/{id}/item", api.UpdateItemHandler)
-	mux.HandleFunc("GET /leaderboard/{id}", api.GetLeaderboardHandler)
-	mux.HandleFunc("POST /leaderboard/{id}/schedule", api.ScheduleUpdateHandler)
-	mux.HandleFunc("POST /leaderboard/{id}/recompute", api.RecomputeLeaderboardHandler)
+	mux.HandleFunc("POST /leaderboard", api.MetricsMiddleware("/leaderboard", api.CreateLeaderboardHandler))
+	mux.HandleFunc("POST /leaderboard/{id}/item", api.MetricsMiddleware("/leaderboard/{id}/item", api.UpdateItemHandler))
+	mux.HandleFunc("GET /leaderboard/{id}", api.MetricsMiddleware("/leaderboard/{id}", api.GetLeaderboardHandler))
+	mux.HandleFunc("POST /leaderboard/{id}/schedule", api.MetricsMiddleware("/leaderboard/{id}/schedule", api.ScheduleUpdateHandler))
+	mux.HandleFunc("POST /leaderboard/{id}/recompute", api.MetricsMiddleware("/leaderboard/{id}/recompute", api.RecomputeLeaderboardHandler))
 
 	server := &http.Server{
 		Addr:              ":8080",
@@ -51,14 +53,30 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// ---------------- 配置 Prometheus 监控路由 (内部端口 9090) ----------------
+	// 生产环境最佳实践：将 /metrics 暴露在独立的内部端口，防止外部用户直接访问监控数据造成泄漏
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr:    ":9090",
+		Handler: metricsMux,
+	}
+
 	// Graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Println("Server listening on :8080")
+		log.Println("Business API Server listening on :8080")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			log.Fatal("Business server error:", err)
+		}
+	}()
+
+	go func() {
+		log.Println("Prometheus Metrics Server listening on :9090")
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("Metrics server error:", err)
 		}
 	}()
 
@@ -69,4 +87,5 @@ func main() {
 	defer cancel()
 
 	server.Shutdown(ctx)
+	metricsServer.Shutdown(ctx)
 }

@@ -3,13 +3,17 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -47,12 +51,19 @@ type Leaderboard struct {
 
 var (
 	Leaderboards = make(map[string]*Leaderboard)
-	LB_Mu        sync.RWMutex
+	lbMu         sync.RWMutex
 	envPool      = sync.Pool{
 		New: func() interface{} {
 			return make(map[string]interface{}, 16)
 		},
 	}
+	restoreGroup singleflight.Group
+	coreLogger   = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+)
+
+var (
+	ErrLeaderboardNotFound = errors.New("leaderboard not found")
+	ErrRestoreFailed       = errors.New("leaderboard restore failed")
 )
 
 func getEnv(data map[string]interface{}, updatedAt int64) map[string]interface{} {
@@ -160,9 +171,9 @@ func CreateLeaderboard(ctx context.Context, id, expression string, schema map[st
 		return nil, fmt.Errorf("failed to save leaderboard metadata: %w", err)
 	}
 
-	LB_Mu.Lock()
+	lbMu.Lock()
 	Leaderboards[id] = lb
-	LB_Mu.Unlock()
+	lbMu.Unlock()
 
 	return lb, nil
 }
@@ -175,63 +186,84 @@ func SetDefaultRepo(repo Repository) {
 }
 
 // GetLeaderboard 获取排行榜实例；如果内存中不存在，则尝试从仓储恢复。
-func GetLeaderboard(ctx context.Context, id string) *Leaderboard {
-	LB_Mu.RLock()
+func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
+	lbMu.RLock()
 	lb, ok := Leaderboards[id]
-	LB_Mu.RUnlock()
+	lbMu.RUnlock()
 	if ok {
-		return lb
+		return lb, nil
 	}
 	if DefaultRepo == nil {
-		return nil
+		return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardNotFound, id)
 	}
 
-	meta, err := DefaultRepo.GetMetadata(ctx, id)
-	if err != nil || len(meta) == 0 {
-		return nil
-	}
-
-	expression := meta["expression"]
-	if expression == "" {
-		return nil
-	}
-	schema := deserializeSchema(meta["schema"])
-	policy := normalizeRefreshPolicy(meta["refresh_policy"])
-	if policy == "" {
-		policy = RefreshPolicyRealtime
-	}
-	cronSpec := meta["cron_spec"]
-
-	program, err := compileProgram(expression, schema)
-	if err != nil {
-		fmt.Printf("恢复排行榜 %s 失败: %v\n", id, err)
-		return nil
-	}
-
-	lb = &Leaderboard{
-		ID:            id,
-		Expression:    expression,
-		Schema:        schema,
-		RefreshPolicy: policy,
-		CronSpec:      cronSpec,
-		program:       program,
-		repo:          DefaultRepo,
-	}
-	if lastRecomputedAt := meta["last_recomputed_at"]; lastRecomputedAt != "" {
-		if ts, parseErr := time.Parse(time.RFC3339Nano, lastRecomputedAt); parseErr == nil {
-			lb.LastRecomputedAt = ts
+	v, err, _ := restoreGroup.Do(id, func() (interface{}, error) {
+		lbMu.RLock()
+		existing, exists := Leaderboards[id]
+		lbMu.RUnlock()
+		if exists {
+			return existing, nil
 		}
-	}
 
-	LB_Mu.Lock()
-	if existing, exists := Leaderboards[id]; exists {
-		LB_Mu.Unlock()
-		return existing
-	}
-	Leaderboards[id] = lb
-	LB_Mu.Unlock()
+		meta, repoErr := DefaultRepo.GetMetadata(ctx, id)
+		if repoErr != nil {
+			return nil, fmt.Errorf("%w: id=%s metadata query failed: %v", ErrRestoreFailed, id, repoErr)
+		}
+		if len(meta) == 0 {
+			return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardNotFound, id)
+		}
 
-	return lb
+		expression := meta["expression"]
+		if expression == "" {
+			return nil, fmt.Errorf("%w: id=%s empty expression", ErrRestoreFailed, id)
+		}
+		schema := deserializeSchema(meta["schema"])
+		policy := normalizeRefreshPolicy(meta["refresh_policy"])
+		if policy == "" {
+			policy = RefreshPolicyRealtime
+		}
+		cronSpec := meta["cron_spec"]
+
+		program, compileErr := compileProgram(expression, schema)
+		if compileErr != nil {
+			return nil, fmt.Errorf("%w: id=%s compile failed: %v", ErrRestoreFailed, id, compileErr)
+		}
+
+		restored := &Leaderboard{
+			ID:            id,
+			Expression:    expression,
+			Schema:        schema,
+			RefreshPolicy: policy,
+			CronSpec:      cronSpec,
+			program:       program,
+			repo:          DefaultRepo,
+		}
+		if lastRecomputedAt := meta["last_recomputed_at"]; lastRecomputedAt != "" {
+			if ts, parseErr := time.Parse(time.RFC3339Nano, lastRecomputedAt); parseErr == nil {
+				restored.LastRecomputedAt = ts
+			}
+		}
+
+		lbMu.Lock()
+		if current, exists := Leaderboards[id]; exists {
+			lbMu.Unlock()
+			return current, nil
+		}
+		Leaderboards[id] = restored
+		lbMu.Unlock()
+		return restored, nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrLeaderboardNotFound) {
+			return nil, err
+		}
+		coreLogger.Error("leaderboard restore failed", "leaderboard_id", id, "error", err)
+		return nil, err
+	}
+	if v == nil {
+		return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardNotFound, id)
+	}
+	return v.(*Leaderboard), nil
 }
 
 func (lb *Leaderboard) evaluateScore(data map[string]interface{}, updatedAt time.Time) (float64, error) {
@@ -312,7 +344,7 @@ func (lb *Leaderboard) Recompute(ctx context.Context) error {
 
 		items, err := lb.repo.GetItems(ctx, lb.ID, batchIDs)
 		if err != nil {
-			fmt.Printf("批量读取条目失败: %v\n", err)
+			coreLogger.Error("batch read items failed", "leaderboard_id", lb.ID, "error", err)
 			continue
 		}
 
@@ -325,7 +357,7 @@ func (lb *Leaderboard) Recompute(ctx context.Context) error {
 			}
 			score, err := lb.evaluateScore(item.Data, item.UpdatedAt)
 			if err != nil {
-				fmt.Printf("重算条目 %s 分数失败: %v\n", item.ID, err)
+				coreLogger.Error("recompute item score failed", "leaderboard_id", lb.ID, "item_id", item.ID, "error", err)
 				continue
 			}
 			scores[item.ID] = score
@@ -334,14 +366,14 @@ func (lb *Leaderboard) Recompute(ctx context.Context) error {
 
 		if len(scores) > 0 {
 			if err := lb.repo.UpdateItemsScores(ctx, lb.ID, scores); err != nil {
-				fmt.Printf("批量更新分数失败: %v\n", err)
+				coreLogger.Error("batch update scores failed", "leaderboard_id", lb.ID, "error", err)
 				continue
 			}
 		}
 
 		if len(validIDs) > 0 {
 			if err := lb.repo.ClearDirtyItemIDs(ctx, lb.ID, validIDs); err != nil {
-				fmt.Printf("批量清理 dirty 标记失败: %v\n", err)
+				coreLogger.Error("batch clear dirty ids failed", "leaderboard_id", lb.ID, "error", err)
 			}
 		}
 	}
@@ -357,7 +389,7 @@ func (lb *Leaderboard) Recompute(ctx context.Context) error {
 func (lb *Leaderboard) GetTopN(ctx context.Context, n int) []*Item {
 	items, err := lb.repo.GetTopN(ctx, lb.ID, n)
 	if err != nil {
-		fmt.Printf("获取排行榜前 %d 名失败: %v\n", n, err)
+		coreLogger.Error("get topN failed", "leaderboard_id", lb.ID, "n", n, "error", err)
 		return []*Item{}
 	}
 

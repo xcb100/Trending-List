@@ -2,6 +2,7 @@ package core_test
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"testing"
@@ -270,4 +271,62 @@ func TestLeaderboard_ScheduledPolicy(t *testing.T) {
 	if len(dirtyIDsAfter) != 0 {
 		t.Errorf("expected dirty items to be empty, got %v", dirtyIDsAfter)
 	}
+}
+
+func TestLeaderboard_GetLeaderboard_ErrorsAndSingleflight(t *testing.T) {
+	repo := newMockRepo()
+	core.SetDefaultRepo(repo)
+	ctx := context.Background()
+
+	// 1. Test ErrLeaderboardNotFound
+	_, err := core.GetLeaderboard(ctx, "not_exist_lb")
+	if !errors.Is(err, core.ErrLeaderboardNotFound) {
+		t.Errorf("expected ErrLeaderboardNotFound, got: %v", err)
+	}
+
+	// 2. Test ErrRestoreFailed (bad expression)
+	badMeta := map[string]string{
+		"expression": "invalid +++ syntax",
+		"schema":     "{}",
+	}
+	repo.SaveMetadata(ctx, "bad_lb", badMeta)
+	_, err = core.GetLeaderboard(ctx, "bad_lb")
+	if !errors.Is(err, core.ErrRestoreFailed) {
+		t.Errorf("expected ErrRestoreFailed for bad expression, got: %v", err)
+	}
+
+	// 3. Test Singleflight and successful restore under concurrency
+	goodMeta := map[string]string{
+		"expression":     "score_base * 2.0",
+		"schema":         `{"score_base": 0.0}`,
+		"refresh_policy": "realtime",
+	}
+	repo.SaveMetadata(ctx, "concurrent_lb", goodMeta)
+
+	var wg sync.WaitGroup
+	var successCount int
+	var mu sync.Mutex
+
+	workers := 50
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			lb, err := core.GetLeaderboard(ctx, "concurrent_lb")
+			if err == nil && lb != nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if successCount != workers {
+		t.Errorf("expected all %d concurrent workers to get the restored leaderboard successfully, got %d", workers, successCount)
+	}
+
+	// Cleanup memory for subsequent tests if necessary
+	core.SetDefaultRepo(nil)
 }
