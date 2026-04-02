@@ -332,57 +332,50 @@ func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[strin
 
 // Recompute 重新计算 dirty 条目的分数。
 func (lb *Leaderboard) Recompute(ctx context.Context) error {
-	itemIDs, err := lb.repo.GetDirtyItemIDs(ctx, lb.ID)
-	if err != nil {
-		return fmt.Errorf("failed to get dirty items: %w", err)
-	}
-
-	if len(itemIDs) == 0 {
-		lb.LastRecomputedAt = time.Now()
-		return lb.repo.SaveMetadata(ctx, lb.ID, metadataFromLeaderboard(lb))
-	}
-
-	batchSize := 500
-	for i := 0; i < len(itemIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(itemIDs) {
-			end = len(itemIDs)
-		}
-		batchIDs := itemIDs[i:end]
-
-		items, err := lb.repo.GetItems(ctx, lb.ID, batchIDs)
+	cursor := uint64(0)
+	for {
+		var batchIDs []string
+		var err error
+		// 1. 采用 SSCAN 分批拉取替代 SMEMBERS，杜绝 1000 万级脏数据引发内存 OOM
+		batchIDs, cursor, err = lb.repo.ScanDirtyItemIDs(ctx, lb.ID, cursor, 500)
 		if err != nil {
-			coreLogger.Error("batch read items failed", "leaderboard_id", lb.ID, "error", err)
-			continue
+			return fmt.Errorf("failed to scan dirty items: %w", err)
 		}
 
-		scores := make(map[string]float64)
-		validIDs := make([]string, 0, len(items))
-
-		for _, item := range items {
-			if item == nil {
-				continue
-			}
-			score, err := lb.evaluateScore(item.Data, item.UpdatedAt)
+		if len(batchIDs) > 0 {
+			items, err := lb.repo.GetItems(ctx, lb.ID, batchIDs)
 			if err != nil {
-				coreLogger.Error("recompute item score failed", "leaderboard_id", lb.ID, "item_id", item.ID, "error", err)
+				coreLogger.Error("batch read items failed", "leaderboard_id", lb.ID, "error", err)
 				continue
 			}
-			scores[item.ID] = score
-			validIDs = append(validIDs, item.ID)
-		}
 
-		if len(scores) > 0 {
-			if err := lb.repo.UpdateItemsScores(ctx, lb.ID, scores); err != nil {
-				coreLogger.Error("batch update scores failed", "leaderboard_id", lb.ID, "error", err)
-				continue
+			scores := make(map[string]float64)
+			updatedAts := make(map[string]time.Time)
+
+			for _, item := range items {
+				if item == nil {
+					continue
+				}
+				score, err := lb.evaluateScore(item.Data, item.UpdatedAt)
+				if err != nil {
+					coreLogger.Error("recompute item score failed", "leaderboard_id", lb.ID, "item_id", item.ID, "error", err)
+					continue
+				}
+				scores[item.ID] = score
+				// 记录计算时的锚点时间，用于防并发覆盖
+				updatedAts[item.ID] = item.UpdatedAt
+			}
+
+			if len(scores) > 0 {
+				// 2. 剥弃 UpdateItemsScores + ClearDirtyItemIDs 极易引发竞态丢失的组合，改用基于 Lua 的单边聚合方法
+				if err := lb.repo.CommitRecomputedScores(ctx, lb.ID, scores, updatedAts); err != nil {
+					coreLogger.Error("batch atomic commit scores failed", "leaderboard_id", lb.ID, "error", err)
+				}
 			}
 		}
 
-		if len(validIDs) > 0 {
-			if err := lb.repo.ClearDirtyItemIDs(ctx, lb.ID, validIDs); err != nil {
-				coreLogger.Error("batch clear dirty ids failed", "leaderboard_id", lb.ID, "error", err)
-			}
+		if cursor == 0 {
+			break
 		}
 	}
 

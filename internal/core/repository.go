@@ -22,6 +22,12 @@ type Repository interface {
 	// MarkItemDirty 标记条目是否需要重算
 	MarkItemDirty(ctx context.Context, lbID string, itemID string, dirty bool) error
 
+	// ScanDirtyItemIDs 分批获取待重算的条目 ID 列表，防止大 key 发生 OOM
+	ScanDirtyItemIDs(ctx context.Context, lbID string, cursor uint64, count int64) ([]string, uint64, error)
+
+	// CommitRecomputedScores 采用原子化提交分数并定点清除脏标记（通过 UpdatedAt 校验防止并发 ABA 覆盖）
+	CommitRecomputedScores(ctx context.Context, lbID string, scores map[string]float64, updatedAts map[string]time.Time) error
+
 	// ClearDirtyItemIDs 批量清除待重算条目
 	ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error
 

@@ -143,6 +143,39 @@ func (m *mockRepo) AcquireLock(ctx context.Context, key string, ttl time.Duratio
 }
 func (m *mockRepo) GetAllLeaderboardIDs(ctx context.Context) ([]string, error) { return nil, nil }
 
+func (m *mockRepo) ScanDirtyItemIDs(ctx context.Context, lbID string, cursor uint64, count int64) ([]string, uint64, error) {
+	if cursor != 0 {
+		return nil, 0, nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var ids []string
+	for id := range m.dirty[lbID] {
+		ids = append(ids, id)
+	}
+	return ids, 0, nil
+}
+
+func (m *mockRepo) CommitRecomputedScores(ctx context.Context, lbID string, scores map[string]float64, updatedAts map[string]time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, sc := range scores {
+		if m.items[lbID] != nil && m.items[lbID][id] != nil {
+			if m.items[lbID][id].UpdatedAt.Equal(updatedAts[id]) {
+				m.items[lbID][id].Score = sc
+				if m.dirty[lbID] != nil {
+					delete(m.dirty[lbID], id)
+				}
+			}
+		} else {
+			if m.dirty[lbID] != nil {
+				delete(m.dirty[lbID], id)
+			}
+		}
+	}
+	return nil
+}
+
 func (m *mockRepo) GetItems(ctx context.Context, lbID string, itemIDs []string) ([]*core.Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

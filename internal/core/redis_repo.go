@@ -176,6 +176,58 @@ func (r *RedisRepository) GetScheduledLeaderboardIDs(ctx context.Context, tier s
 	return r.client.SMembers(ctx, scheduledTierKey(tier)).Result()
 }
 
+func (r *RedisRepository) ScanDirtyItemIDs(ctx context.Context, lbID string, cursor uint64, count int64) ([]string, uint64, error) {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	return r.client.SScan(ctx, r.dirtyKey(lbID), cursor, "", count).Result()
+}
+
+const commitRecomputeScript = `
+local itemsKey = KEYS[1]
+local scoresKey = KEYS[2]
+local dirtyKey = KEYS[3]
+
+for i=1, #ARGV, 3 do
+    local itemID = ARGV[i]
+    local score = tonumber(ARGV[i+1])
+    local expectedTS = ARGV[i+2]
+    
+    local payload = redis.call('HGET', itemsKey, itemID)
+    if payload then
+        local matchStr = '"updated_at":' .. expectedTS
+        -- 利用 Lua 原生字符串搜索平替高昂的 cjson.decode 序列化开销
+        if string.find(payload, matchStr, 1, true) then
+            redis.call('ZADD', scoresKey, score, itemID)
+            redis.call('SREM', dirtyKey, itemID)
+        end
+        -- 如果没查到该时间戳，说明期间有新数据到达（ABA问题被打破），中止清除打回原位等下轮
+    else
+        -- 源数据已丢失，强行修剪废弃脏标记与分数
+        redis.call('SREM', dirtyKey, itemID)
+        redis.call('ZREM', scoresKey, itemID)
+    end
+end
+return 1
+`
+
+func (r *RedisRepository) CommitRecomputedScores(ctx context.Context, lbID string, scores map[string]float64, updatedAts map[string]time.Time) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	if len(scores) == 0 {
+		return nil
+	}
+
+	var args []interface{}
+	for id, score := range scores {
+		ts := updatedAts[id]
+		rawJSON, _ := ts.MarshalJSON() // 将输出类似 `"2026-..."`
+		args = append(args, id, score, string(rawJSON))
+	}
+
+	return r.client.Eval(ctx, commitRecomputeScript, []string{r.itemsKey(lbID), r.scoresKey(lbID), r.dirtyKey(lbID)}, args...).Err()
+}
+
 func (r *RedisRepository) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
