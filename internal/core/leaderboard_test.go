@@ -130,6 +130,19 @@ func (m *mockRepo) GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, 
 	return ids, nil
 }
 
+// Ensure mockRepo satisfies fully the updated Repository interface
+func (m *mockRepo) AddScheduledLeaderboard(ctx context.Context, lbID string, tier string) error {
+	return nil
+}
+func (m *mockRepo) RemoveScheduledLeaderboard(ctx context.Context, lbID string) error { return nil }
+func (m *mockRepo) GetScheduledLeaderboardIDs(ctx context.Context, tier string) ([]string, error) {
+	return nil, nil
+}
+func (m *mockRepo) AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+func (m *mockRepo) GetAllLeaderboardIDs(ctx context.Context) ([]string, error) { return nil, nil }
+
 func (m *mockRepo) GetItems(ctx context.Context, lbID string, itemIDs []string) ([]*core.Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

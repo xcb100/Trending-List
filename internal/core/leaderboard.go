@@ -171,6 +171,14 @@ func CreateLeaderboard(ctx context.Context, id, expression string, schema map[st
 		return nil, fmt.Errorf("failed to save leaderboard metadata: %w", err)
 	}
 
+	// 核心优化：维护定向梯队子集，避免后台定时器进行高昂的全局扫表
+	if policy == RefreshPolicyScheduled {
+		tier := DetermineTier(cronSpec)
+		_ = repo.AddScheduledLeaderboard(ctx, id, tier)
+	} else {
+		_ = repo.RemoveScheduledLeaderboard(ctx, id)
+	}
+
 	lbMu.Lock()
 	Leaderboards[id] = lb
 	lbMu.Unlock()

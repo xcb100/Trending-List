@@ -25,6 +25,21 @@ type Repository interface {
 	// ClearDirtyItemIDs 批量清除待重算条目
 	ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error
 
+	// AcquireLock 获取分布式锁（防止多个副本并发执行定时任务）
+	AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
+
+	// GetAllLeaderboardIDs 获取系统中注册的所有排行榜 ID
+	GetAllLeaderboardIDs(ctx context.Context) ([]string, error)
+
+	// AddScheduledLeaderboard 记录定时策略的排行榜 ID，附加分级 tier 属性
+	AddScheduledLeaderboard(ctx context.Context, lbID string, tier string) error
+
+	// RemoveScheduledLeaderboard 移除定时策略的排行榜 ID
+	RemoveScheduledLeaderboard(ctx context.Context, lbID string) error
+
+	// GetScheduledLeaderboardIDs 获取对应分级 tier 的定时策略排行榜 ID
+	GetScheduledLeaderboardIDs(ctx context.Context, tier string) ([]string, error)
+
 	// GetDirtyItemIDs 获取待重算的条目 ID 列表
 	GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, error)
 

@@ -207,6 +207,10 @@ func ScheduleUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 添加至对应的分级调度队列
+	tier := core.DetermineTier(req.CronSpec)
+	_ = core.DefaultRepo.AddScheduledLeaderboard(r.Context(), lb.ID, tier)
+
 	sendJSON(w, http.StatusOK, map[string]string{"status": "scheduled"})
 }
 
@@ -240,5 +244,22 @@ func RecomputeLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 		"status":             "recomputed",
 		"id":                 lb.ID,
 		"last_recomputed_at": lb.LastRecomputedAt,
+	})
+}
+
+// API 名称: SystemCronTickHandler
+// 输入: 空 (建议 1 次/分钟 的外部 K8s CronJob 触发)
+// 输出: JSON (状态)
+// 目的功能: 提供单个全局心跳接口。由于已经切换为基于 Redis 分布式锁的内部 5秒级 调度，此接口降级为手动触发的备用手段。
+func SystemCronTickHandler(w http.ResponseWriter, r *http.Request) {
+	for _, t := range []string{core.Tier5s, core.Tier1m, core.Tier30m, core.Tier6h} {
+		if err := core.ProcessCronTick(r.Context(), t); err != nil {
+			sendError(w, http.StatusInternalServerError, "执行系统全局 Cron 发生异常: "+err.Error())
+			return
+		}
+	}
+	sendJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ticked_all_tiers",
+		"time":   time.Now().Format(time.RFC3339),
 	})
 }

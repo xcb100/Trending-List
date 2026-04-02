@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -98,10 +99,81 @@ func (r *RedisRepository) UpsertItem(ctx context.Context, lbID string, itemID st
 func (r *RedisRepository) MarkItemDirty(ctx context.Context, lbID string, itemID string, dirty bool) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
+
 	if dirty {
 		return r.client.SAdd(ctx, r.dirtyKey(lbID), itemID).Err()
 	}
 	return r.client.SRem(ctx, r.dirtyKey(lbID), itemID).Err()
+}
+
+func (r *RedisRepository) AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	return r.client.SetNX(ctx, key, "1", ttl).Result()
+}
+
+func (r *RedisRepository) GetAllLeaderboardIDs(ctx context.Context) ([]string, error) {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	var ids []string
+	var cursor uint64
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = r.client.Scan(ctx, cursor, "lb:*:meta", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			parts := strings.Split(key, ":")
+			if len(parts) >= 3 {
+				ids = append(ids, parts[1])
+			}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	return ids, nil
+}
+
+const (
+	Tier5s  = "5s"
+	Tier1m  = "1m"
+	Tier30m = "30m"
+	Tier6h  = "6h"
+)
+
+var allTiers = []string{Tier5s, Tier1m, Tier30m, Tier6h}
+
+func scheduledTierKey(tier string) string {
+	return "global:scheduled_lbs:" + tier
+}
+
+func (r *RedisRepository) AddScheduledLeaderboard(ctx context.Context, lbID string, tier string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	// 先从所有层级中移除，防止因更新频率导致在多个 SET 中重复存在
+	for _, t := range allTiers {
+		r.client.SRem(ctx, scheduledTierKey(t), lbID)
+	}
+	return r.client.SAdd(ctx, scheduledTierKey(tier), lbID).Err()
+}
+
+func (r *RedisRepository) RemoveScheduledLeaderboard(ctx context.Context, lbID string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	for _, t := range allTiers {
+		r.client.SRem(ctx, scheduledTierKey(t), lbID)
+	}
+	return nil
+}
+
+func (r *RedisRepository) GetScheduledLeaderboardIDs(ctx context.Context, tier string) ([]string, error) {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	return r.client.SMembers(ctx, scheduledTierKey(tier)).Result()
 }
 
 func (r *RedisRepository) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error {

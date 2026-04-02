@@ -44,6 +44,9 @@ func main() {
 	mux.HandleFunc("POST /leaderboard/{id}/schedule", api.MetricsMiddleware("/leaderboard/{id}/schedule", api.ScheduleUpdateHandler))
 	mux.HandleFunc("POST /leaderboard/{id}/recompute", api.MetricsMiddleware("/leaderboard/{id}/recompute", api.RecomputeLeaderboardHandler))
 
+	// 全局定时器滴答接口，供 K8s 内部单个定时任务固定唤醒
+	mux.HandleFunc("POST /system/cron/tick", api.MetricsMiddleware("/system/cron/tick", api.SystemCronTickHandler))
+
 	server := &http.Server{
 		Addr:              ":8080",
 		Handler:           mux,
@@ -79,6 +82,9 @@ func main() {
 			log.Fatal("Metrics server error:", err)
 		}
 	}()
+
+	// ---------------- 启动高精度分布式内置定时任务 ----------------
+	go core.StartCronScheduler(context.Background())
 
 	<-stop
 	log.Println("Shutting down...")
