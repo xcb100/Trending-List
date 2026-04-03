@@ -11,7 +11,7 @@ import (
 	"awesomeProject/internal/core"
 )
 
-// mockRepo is an in-memory repository for unit testing core logic.
+// mockRepo 是一个内存版仓储，用于核心逻辑单元测试。
 type mockRepo struct {
 	mu       sync.RWMutex
 	metadata map[string]map[string]string
@@ -31,7 +31,7 @@ func (m *mockRepo) GetMetadata(ctx context.Context, lbID string) (map[string]str
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if meta, ok := m.metadata[lbID]; ok {
-		// return a copy
+		// 返回副本，避免测试里共享底层 map。
 		res := make(map[string]string, len(meta))
 		for k, v := range meta {
 			res[k] = v
@@ -45,6 +45,15 @@ func (m *mockRepo) SaveMetadata(ctx context.Context, lbID string, metadata map[s
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.metadata[lbID] = metadata
+	return nil
+}
+
+func (m *mockRepo) DeleteLeaderboard(ctx context.Context, lbID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.metadata, lbID)
+	delete(m.items, lbID)
+	delete(m.dirty, lbID)
 	return nil
 }
 
@@ -95,6 +104,18 @@ func (m *mockRepo) UpsertItem(ctx context.Context, lbID string, itemID string, s
 	return nil
 }
 
+func (m *mockRepo) DeleteItem(ctx context.Context, lbID string, itemID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.items[lbID] != nil {
+		delete(m.items[lbID], itemID)
+	}
+	if m.dirty[lbID] != nil {
+		delete(m.dirty[lbID], itemID)
+	}
+	return nil
+}
+
 func (m *mockRepo) MarkItemDirty(ctx context.Context, lbID string, itemID string, dirty bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -120,6 +141,24 @@ func (m *mockRepo) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs [
 	return nil
 }
 
+func (m *mockRepo) PruneItems(ctx context.Context, lbID string, itemIDs []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dirty[lbID] != nil {
+		for _, id := range itemIDs {
+			delete(m.dirty[lbID], id)
+		}
+	}
+	if m.items[lbID] != nil {
+		for _, id := range itemIDs {
+			if item := m.items[lbID][id]; item != nil {
+				item.Score = 0
+			}
+		}
+	}
+	return nil
+}
+
 func (m *mockRepo) GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -130,7 +169,7 @@ func (m *mockRepo) GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, 
 	return ids, nil
 }
 
-// Ensure mockRepo satisfies fully the updated Repository interface
+// 确保 mockRepo 完整实现更新后的 Repository 接口。
 func (m *mockRepo) AddScheduledLeaderboard(ctx context.Context, lbID string, tier string) error {
 	return nil
 }
@@ -141,6 +180,7 @@ func (m *mockRepo) GetScheduledLeaderboardIDs(ctx context.Context, tier string) 
 func (m *mockRepo) AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	return true, nil
 }
+func (m *mockRepo) ReleaseLock(ctx context.Context, key string) error          { return nil }
 func (m *mockRepo) GetAllLeaderboardIDs(ctx context.Context) ([]string, error) { return nil, nil }
 
 func (m *mockRepo) ScanDirtyItemIDs(ctx context.Context, lbID string, cursor uint64, count int64) ([]string, uint64, error) {
@@ -184,7 +224,7 @@ func (m *mockRepo) GetItems(ctx context.Context, lbID string, itemIDs []string) 
 		if item, ok := m.items[lbID][id]; ok {
 			res = append(res, &core.Item{
 				ID:        item.ID,
-				Data:      item.Data, // simplified for test
+				Data:      item.Data, // 测试场景下这里直接复用即可。
 				Score:     item.Score,
 				UpdatedAt: item.UpdatedAt,
 			})
@@ -214,7 +254,7 @@ func (m *mockRepo) GetTopN(ctx context.Context, lbID string, n int) ([]*core.Ite
 	}
 
 	sort.Slice(all, func(i, j int) bool {
-		return all[i].Score > all[j].Score // descending
+		return all[i].Score > all[j].Score // 按分数降序排列。
 	})
 
 	if len(all) > n {
@@ -255,7 +295,7 @@ func TestLeaderboard_RealtimePolicy(t *testing.T) {
 		t.Fatalf("unexpected error creating leaderboard: %v", err)
 	}
 
-	// Add item
+	// 写入条目
 	item, err := lb.UpsertItem(ctx, "item1", map[string]interface{}{"views": 100.0, "likes": 10.0})
 	if err != nil {
 		t.Fatalf("unexpected error upserting item: %v", err)
@@ -266,7 +306,10 @@ func TestLeaderboard_RealtimePolicy(t *testing.T) {
 		t.Errorf("expected score %f, got %f", expectedScore, item.Score)
 	}
 
-	top := lb.GetTopN(ctx, 1)
+	top, err := lb.GetTopN(ctx, 1)
+	if err != nil {
+		t.Fatalf("unexpected error reading topN: %v", err)
+	}
 	if len(top) != 1 || top[0].ID != "item1" || top[0].Score != expectedScore {
 		t.Errorf("expected item1 with score %f, got %+v", expectedScore, top)
 	}
@@ -279,12 +322,12 @@ func TestLeaderboard_ScheduledPolicy(t *testing.T) {
 	schema := map[string]interface{}{"score_base": 0.0}
 	expr := "score_base * 10.0"
 
-	lb, err := core.CreateLeaderboard(ctx, "test_cron", expr, schema, core.RefreshPolicyScheduled, "cron", repo)
+	lb, err := core.CreateLeaderboard(ctx, "test_cron", expr, schema, core.RefreshPolicyScheduled, "@every 10s", repo)
 	if err != nil {
 		t.Fatalf("unexpected error creating leaderboard: %v", err)
 	}
 
-	// Add item
+	// 写入条目
 	item, err := lb.UpsertItem(ctx, "item1", map[string]interface{}{"score_base": 5.0})
 	if err != nil {
 		t.Fatalf("unexpected error upserting item: %v", err)
@@ -299,12 +342,15 @@ func TestLeaderboard_ScheduledPolicy(t *testing.T) {
 		t.Errorf("expected item1 to be dirty, got %v", dirtyIDs)
 	}
 
-	// Recompute
+	// 执行重算
 	if err := lb.Recompute(ctx); err != nil {
 		t.Fatalf("unexpected error recomputing: %v", err)
 	}
 
-	top := lb.GetTopN(ctx, 1)
+	top, err := lb.GetTopN(ctx, 1)
+	if err != nil {
+		t.Fatalf("unexpected error reading topN: %v", err)
+	}
 	if len(top) != 1 || top[0].ID != "item1" {
 		t.Fatalf("expected item1 in top N after recompute")
 	}
@@ -324,13 +370,13 @@ func TestLeaderboard_GetLeaderboard_ErrorsAndSingleflight(t *testing.T) {
 	core.SetDefaultRepo(repo)
 	ctx := context.Background()
 
-	// 1. Test ErrLeaderboardNotFound
+	// 1. 验证 ErrLeaderboardNotFound
 	_, err := core.GetLeaderboard(ctx, "not_exist_lb")
 	if !errors.Is(err, core.ErrLeaderboardNotFound) {
 		t.Errorf("expected ErrLeaderboardNotFound, got: %v", err)
 	}
 
-	// 2. Test ErrRestoreFailed (bad expression)
+	// 2. 验证 ErrRestoreFailed（坏表达式）
 	badMeta := map[string]string{
 		"expression": "invalid +++ syntax",
 		"schema":     "{}",
@@ -341,7 +387,7 @@ func TestLeaderboard_GetLeaderboard_ErrorsAndSingleflight(t *testing.T) {
 		t.Errorf("expected ErrRestoreFailed for bad expression, got: %v", err)
 	}
 
-	// 3. Test Singleflight and successful restore under concurrency
+	// 3. 验证并发场景下的 singleflight 恢复
 	goodMeta := map[string]string{
 		"expression":     "score_base * 2.0",
 		"schema":         `{"score_base": 0.0}`,
@@ -373,6 +419,6 @@ func TestLeaderboard_GetLeaderboard_ErrorsAndSingleflight(t *testing.T) {
 		t.Errorf("expected all %d concurrent workers to get the restored leaderboard successfully, got %d", workers, successCount)
 	}
 
-	// Cleanup memory for subsequent tests if necessary
+	// 清理内存状态，避免影响后续测试
 	core.SetDefaultRepo(nil)
 }

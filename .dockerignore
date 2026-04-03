@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.claude
+.gocache
+.gotmp
+awesomeProject.exe
+vendor
+*.log
+*.tmp

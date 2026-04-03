@@ -1,125 +1,497 @@
-# 热点榜单微服务
+# 排行榜微服务
 
-这是一个基于 Go 的热点榜单微服务，支持：
+一个基于 Go 和 Redis 的排行榜微服务，面向内部微服务调用场景设计。服务支持动态评分表达式、实时榜与定时榜两种刷新模式，并为后续容器化、Kubernetes 部署和基础监控接入预留了较完整的运行接口。
 
-- 自定义榜单字段 schema
-- 自定义表达式排序
-- `realtime` 实时更新分数
-- `scheduled` 定时批量重算分数
-- `POST /leaderboard/{id}/recompute` 手动触发重算
-- Redis 仓储访问超时控制
+## 功能概览
 
-## 接口说明
+- 创建排行榜
+- 写入或更新条目
+- 查询 Top N
+- 手动触发重算
+- 在线更新定时表达式
+- 在线更新评分表达式
+- 删除排行榜
+- 删除单个条目
+- 健康检查接口
+- Prometheus 指标暴露
+- 容器化与 Kubernetes 清单
 
-### 1. 创建榜单
+## 刷新模式
+
+### `realtime`
+
+写入条目时立即计算分数，并同步更新排行榜结果。
+
+适合：
+
+- 排名结果需要尽量实时
+- 表达式复杂度适中
+- 写入量在服务可承受范围内
+
+### `scheduled`
+
+写入条目时仅保存原始数据并标记为 dirty，后续由内置调度器或手动接口批量重算。
+
+适合：
+
+- 写入频率较高
+- 评分表达式较复杂
+- 可以接受按批次刷新结果
+
+## 项目结构
+
+```text
+.
+├── main.go
+├── Dockerfile
+├── k8s/
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   ├── service.yaml
+│   ├── deployment.yaml
+│   └── kustomization.yaml
+├── cmd/
+│   ├── loadtest/
+│   ├── loadtest_cron/
+│   ├── loadtest_d/
+│   └── loadtest_e/
+└── internal/
+    ├── app/
+    │   └── app.go
+    ├── api/
+    │   ├── health.go
+    │   ├── leaderboard_handlers.go
+    │   ├── metrics.go
+    │   ├── requests.go
+    │   ├── response.go
+    │   ├── router.go
+    │   └── system_handlers.go
+    ├── config/
+    │   └── config.go
+    └── core/
+        ├── leaderboard.go
+        ├── metrics.go
+        ├── redis_repo.go
+        ├── repository.go
+        ├── runtime_config.go
+        ├── tick.go
+        ├── timeouts.go
+        └── *_test.go
+```
+
+当前结构分层重点：
+
+- `internal/app`：应用装配、Redis 初始化、HTTP Server 生命周期管理
+- `internal/api`：路由、HTTP Handler、健康检查、HTTP 指标
+- `internal/config`：环境变量配置加载
+- `internal/core`：排行榜核心逻辑、Redis 仓储、调度器、核心指标
+
+## 运行要求
+
+- Go `1.25+`
+- Redis `6+`
+
+## 环境变量
+
+### 服务监听
+
+- `BUSINESS_ADDR`
+  默认值：`:8080`
+- `INTERNAL_ADDR`
+  默认值：`:9090`
+
+### Redis
+
+- `REDIS_ADDR`
+  默认值：`localhost:6379`
+- `REDIS_PASSWORD`
+  默认值：空
+- `REDIS_DB`
+  默认值：`0`
+- `REDIS_DIAL_TIMEOUT`
+  默认值：`1s`
+- `REDIS_READ_TIMEOUT`
+  默认值：`1s`
+- `REDIS_WRITE_TIMEOUT`
+  默认值：`1s`
+- `REDIS_POOL_TIMEOUT`
+  默认值：`2s`
+- `REDIS_REPOSITORY_TIMEOUT`
+  默认值：`800ms`
+
+### HTTP 与生命周期
+
+- `HTTP_READ_HEADER_TIMEOUT`
+  默认值：`2s`
+- `HTTP_READ_TIMEOUT`
+  默认值：`5s`
+- `HTTP_WRITE_TIMEOUT`
+  默认值：`10s`
+- `HTTP_IDLE_TIMEOUT`
+  默认值：`60s`
+- `SHUTDOWN_TIMEOUT`
+  默认值：`5s`
+- `HEALTHCHECK_TIMEOUT`
+  默认值：`1s`
+
+### 调度与锁
+
+- `SCHEDULER_ENABLED`
+  默认值：`true`
+- `SCHEDULED_TASK_TIMEOUT`
+  默认值：`5s`
+- `SCHEDULED_TASK_LOCK_TTL`
+  默认值：`10s`
+- `LEADERBOARD_CREATE_LOCK_TTL`
+  默认值：`5s`
+
+## 本地启动
+
+```powershell
+go run .
+```
+
+默认端口：
+
+- `:8080` 业务接口
+- `:9090` 内部接口
+
+## 健康检查
+
+业务端口与内部端口均提供以下接口：
+
+- `GET /livez`
+  存活检查
+- `GET /readyz`
+  就绪检查，会检查 Redis 连通性
+- `GET /healthz`
+  综合健康检查，会检查 Redis 连通性
+
+## 端口职责
+
+### 业务端口 `8080`
+
+主要承载业务 API：
+
+- 创建排行榜
+- 写入条目
+- 查询排行榜
+- 更新定时策略
+- 更新评分表达式
+- 手动重算
+- 删除条目
+- 删除排行榜
+
+### 内部端口 `9090`
+
+主要承载内部接口：
+
+- `GET /metrics`
+- `POST /system/cron/tick`
+- 健康检查接口
+
+## HTTP API
+
+### 1. 创建排行榜
 
 `POST /leaderboard`
 
-请求体示例：
+请求示例：
 
 ```json
 {
   "id": "top_videos",
-  "expression": "views + likes * 2",
+  "expression": "views * 0.5 + likes * 2 + bonus",
   "schema": {
     "views": 0,
-    "likes": 0
+    "likes": 0,
+    "bonus": 0
   },
   "refresh_policy": "realtime"
 }
 ```
 
-定时榜单示例：
+定时榜示例：
 
 ```json
 {
   "id": "hot_articles",
-  "expression": "views * 0.5 + likes * 5",
+  "expression": "views * 0.2 + likes * 5 + shares * 8",
   "schema": {
     "views": 0,
-    "likes": 0
+    "likes": 0,
+    "shares": 0
   },
   "refresh_policy": "scheduled",
   "cron_spec": "@every 10s"
 }
 ```
 
-### 2. 写入条目
+说明：
+
+- 同名排行榜重复创建会返回冲突
+- `scheduled` 模式下会校验 `cron_spec`
+
+### 2. 写入或更新条目
 
 `POST /leaderboard/{id}/item`
+
+请求示例：
 
 ```json
 {
   "item_id": "video_123",
   "data": {
     "views": 1000,
-    "likes": 50
+    "likes": 50,
+    "bonus": 3
   }
 }
 ```
 
-- `realtime`：写入后立即计算并更新分数
-- `scheduled`：写入后只保存原始数据并标记 dirty，等待 cron 或手动重算
+行为：
 
-### 3. 查看榜单
+- `realtime` 模式下立即计算并写入分数
+- `scheduled` 模式下保存原始数据并标记 dirty
+
+### 3. 查询排行榜
 
 `GET /leaderboard/{id}?n=10`
 
-### 4. 手动重算榜单
+说明：
+
+- 默认返回前 `10` 条
+- Redis 读取失败时会返回错误，而不是静默返回空榜
+
+### 4. 手动触发重算
 
 `POST /leaderboard/{id}/recompute`
 
-## 运行方式
+说明：
 
-确保本地 Redis 可用，默认地址是 `localhost:6379`。
+- 处理 dirty 条目并更新排行榜结果
+- 如果同一排行榜已有重算任务执行中，会返回冲突
 
-```powershell
-go run .
+### 5. 更新定时策略
+
+`POST /leaderboard/{id}/schedule`
+
+请求示例：
+
+```json
+{
+  "cron_spec": "@every 30s"
+}
 ```
 
-如需自定义 Redis 地址，可设置环境变量 `REDIS_ADDR`（以及可选的 `REDIS_PASSWORD`）。
+说明：
 
-## 核心特性与架构设计
+- 会把排行榜切换为 `scheduled`
+- 会重新注册调度分层
 
-本项目在设计与压测过程（详情参考 `TEST_PLAN_AND_RESULTS.md`）中引入了多项生产级优化与并发控制策略：
+### 6. 在线更新评分表达式
 
-### 1. 动态表达式与脏数据懒更新
-- **自定义积分引擎**：基于 `expr` 提供动态规则解析，支持业务方随时配置复杂的加权算分逻辑。
-- **脏数据懒写机制 (Lazy Evaluation)**：对于配置了 `scheduled` 策略的榜单，高频的条目变动只会暂存负载数据并打上 `dirty` 标记。复杂的公式算分被延后至后台批处理，极大提升了主流程的写入吞吐。
-- **AST 解析缓存**：针对高频使用的排行榜和 Cron 语法树，使用本地 `sync.Map` 进行解析对象缓存，减少每次处理时的并发 CPU 开销。
+`POST /leaderboard/{id}/expression`
 
-### 2. 高性能分批处理与存取优化
-- **双层 Pipeline 存取**：Redis 仓储层利用 Pipeline 将多条 HSET/ZADD/SREM 命令打包发送，有效降低 RTT（往返时延）。
-- **后台分批重算 (Batching)**：`Recompute` 任务通过限制每次读取和写入的 Batch Size (如 500 条/批)，平滑消化并重算庞大的脏数据集，避免大批量数据导致的 Redis 阻塞和内存尖刺。
-- **恒定内存流控 (OOM 防御)**：清算海量脏数据时不使用危险的 `SMEMBERS` 全量读取，而是改造为基于游标的 `SSCAN` 分页提取。在大数据情况下，Go 进程的内存开销始终保持恒定，降低 OOM 风险。
+请求示例：
 
-### 3. 数据一致性与高可用控制
-- **Lua 乐观锁防御 ABA 并发覆盖**：针对 "读取脏数据 -> 计算分数 -> 删除脏标记" 流程中极易产生的竞态问题，使用 Redis Lua 原子脚本，将 `UpdatedAt` 时间戳作为 CAS 乐观锁版本号。若在计算期间发生新的用户请求触发更新，系统精准中止当前批次的脏标记清除，做到 **0 数据丢失和安全覆盖**。
-- **Singleflight 防雪崩**：对于系统冷启动或特定榜单配置被并发大量访问的场景，应用通过 `golang.org/x/sync/singleflight` 机制收束请求。不管瞬间涌入多少并发，同一个榜单的元数据重建操作只会对 Redis 发起一次拉取，保护底层存储。
-- **强制请求级超时管控**：所有连接 Redis 的仓储操作强制继承并附加细粒度的时间设定（Timeouts），遇到外部链路抖动立刻熔断释放，防止协程长连接泄漏。
+```json
+{
+  "expression": "views * 0.3 + likes * 4 + shares * 10",
+  "schema": {
+    "views": 0,
+    "likes": 0,
+    "shares": 0
+  }
+}
+```
 
-### 4. 分布式高精度定时调度
-针对 K8s 原生 CronJob 依赖 YAML 配置且仅支持分钟级精度的痛点，内置轻量级调度器：
-- **微秒级降级队列 (Tiered Routing)**：支持秒级执行要求（如 `*/5 * * * * *`）。通过在缓存层拆分出 `5s`, `1m`, `30m`, `6h` 的分布式子集（Subset），后台定时器通过直接访问对应子集的 Set 来获取需要执行任务的榜单，避开了传统定时任务轮询全量数据的 O(N) 性能瓶颈。
-- **分布式抢占锁 (Distributed Locking)**：微服务多副本场景下，基于 Redis `SETNX` (附带兜底 TTL 过期) 自动抢占后台重算任务，避免多节点并发写发生数据踩踏。
+说明：
 
-### 5. 生产级可观测性隔离
-- **内外网端口隔离**：业务 API 默认运行于 `8080` 端口，而 Prometheus 相关探针与系统进程（GC、Goroutine）数据被保护在内部专用的 `9090` 端口，防止运营数据泄漏。
-- **结构化打点与日志**：
-  - 基于官方 `log/slog` 构建包含了请求标识与上下文标签的底层日志系统。
-  - 通过注入 Middleware 输出标准的 HTTP Metrics，能直接用于绘制 P99/P95 与每秒 QPS。
+- `expression` 必填
+- `schema` 可选
+- 如果提供 `schema`，会替换原有 schema
+- 更新成功后会执行一次全量重算
+
+### 7. 删除条目
+
+`DELETE /leaderboard/{id}/item/{item_id}`
+
+说明：
+
+- 删除原始条目数据
+- 删除对应分数
+- 删除 dirty 标记
+
+### 8. 删除排行榜
+
+`DELETE /leaderboard/{id}`
+
+说明：
+
+- 删除元数据、原始条目、分数集合、dirty 集合
+- 清理调度分层索引
+- 清理当前进程内缓存对象
+
+### 9. 手动触发全部调度层
+
+`POST /system/cron/tick`
+
+说明：
+
+- 该接口仅挂在内部端口
+- 适合内部运维触发、联调和调度补偿
+
+
+## 核心实现说明
+
+### 表达式执行
+
+评分表达式基于 `github.com/expr-lang/expr` 编译执行。
+
+当前处理方式：
+
+- 创建排行榜时编译表达式
+- 更新表达式时重新编译
+- 运行时环境基于 `schema` 和条目数据生成
+- 支持 `updated_at` 和 `now`
+
+### 并发与一致性
+
+当前实现包含以下处理：
+
+- 排行榜恢复使用 `singleflight`
+- 排行榜运行时状态增加互斥保护
+- 定时重算与手动重算使用 Redis 锁避免重复执行
+- 创建排行榜增加创建锁，减少重复创建覆盖风险
+- 批量重算发生部分失败时返回错误，不再伪装为成功
+- dirty 条目通过 `SSCAN` 分批扫描
+- 脏条目缺失或损坏时会在重算过程中清理
+
+### 调度器
+
+服务内置轻量分层调度器，当前层级包括：
+
+- `5s`
+- `1m`
+- `30m`
+- `6h`
+
+执行逻辑：
+
+1. 从对应分层集合读取候选排行榜
+2. 结合 `cron_spec` 和 `last_recomputed_at` 判断是否到期
+3. 获取 Redis 锁避免重复重算
+4. 在受控超时内执行重算
+
+## 可观测性
+
+### 已提供
+
+- 健康检查接口
+- Prometheus `/metrics`
+- HTTP 请求总量与延迟指标
+- 排行榜创建、恢复、写入、重算、表达式更新、删除、调度 tick 等核心指标
+- JSON 结构化日志
+
+### 当前指标示例
+
+- `http_requests_total`
+- `http_request_duration_seconds`
+- `leaderboard_create_total`
+- `leaderboard_restore_total`
+- `leaderboard_upsert_total`
+- `leaderboard_recompute_total`
+- `leaderboard_recompute_duration_seconds`
+- `leaderboard_expression_update_total`
+- `leaderboard_expression_update_duration_seconds`
+- `leaderboard_scheduler_tick_total`
+- `leaderboards_loaded`
+
+## Docker
+
+### 构建镜像
+
+```
+docker build -t leaderboard-service:latest .
+```
+
+### 启动容器
+
+```
+docker run --rm -p 8080:8080 -p 9090:9090 `
+  -e REDIS_ADDR=host.docker.internal:6379 `
+  leaderboard-service:latest
+```
+
+## Kubernetes
+
+`k8s/` 目录提供了基础部署资源：
+
+- `Namespace`
+- `ConfigMap`
+- `Secret`
+- `Service`
+- `Deployment`
+- `Kustomization`
+
+其中：
+
+- `leaderboard-service` 暴露业务端口 `8080`
+- `leaderboard-internal` 暴露内部端口 `9090`
+- Pod 上带有 Prometheus 抓取注解
+- 使用 readiness/liveness/startup probe
+
+### 部署
+
+```powershell
+kubectl apply -k k8s/
+```
+
+### 查看服务
+
+```powershell
+kubectl -n leaderboard get deploy,svc,pod
+```
+
 ## 测试
+
+### 运行全部测试
 
 ```powershell
 go test ./...
 ```
-（包含完整的单测、并发防击穿断言与各种自动化极端测试脚本，详情请见 `cmd/loadtest_*` 的基准压测模块）
 
-## 设计说明
+如果在 Windows 下默认 Go 缓存目录不可写，可以使用工作区缓存：
 
-- 榜单元数据会持久化 `expression`、`schema`、`refresh_policy`、`cron_spec`
-- `scheduled` 模式通过 dirty 集合追踪待重算条目
-- 仓储层通过 `Repository` 抽象屏蔽业务层与具体存储实现
-- Redis 仓储层会基于 `ctx` 自动附加默认超时，避免存储调用无限阻塞
-- 如果上游已经传入更短的 deadline，会直接复用上游 deadline，不会放大超时窗口
-- HTTP 服务和 Redis 客户端也额外配置了网络级超时，作为第二层保护
+```powershell
+$env:GOCACHE="$PWD\\.gocache"
+$env:GOTMPDIR="$PWD\\.gotmp"
+go test ./...
+```
+
+### 综合 Redis 终极测试
+
+[internal/core/ultimate_redis_test.go](/c:/Users/Administrator/GolandProjects/awesomeProject/internal/core/ultimate_redis_test.go) 使用真实 Redis 做一条较完整的集成链路验证，覆盖：
+
+- 实时榜
+- 定时榜
+- 非法 `cron_spec`
+- 重复创建冲突
+- 在线更新表达式
+- 条目删除
+- 排行榜删除
+- 大批量数据写入与重算
+- 并发重算冲突处理
+
+
+## 压测辅助程序
+
+项目内置了几组辅助程序，可用于本地联调和简单压测：
+
+- `go run ./cmd/loadtest`
+- `go run ./cmd/loadtest_cron`
+- `go run ./cmd/loadtest_d`
+- `go run ./cmd/loadtest_e`
+

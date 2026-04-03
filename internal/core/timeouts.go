@@ -6,22 +6,32 @@ import (
 )
 
 const (
-	// RedisRepositoryTimeout 是仓储层访问 Redis 的默认超时时间。
-	RedisRepositoryTimeout = 800 * time.Millisecond
-	// ScheduledTaskTimeout 是定时任务执行一次重算的默认超时时间。
-	ScheduledTaskTimeout = 5 * time.Second
+	defaultRedisRepositoryTimeout = 800 * time.Millisecond
+	defaultScheduledTaskTimeout   = 5 * time.Second
+	defaultScheduledTaskLockTTL   = defaultScheduledTaskTimeout + 5*time.Second
+	defaultCreateLockTTL          = 5 * time.Second
 )
 
-// WithOperationTimeout 为一次操作附加默认超时。
-// 如果上游 ctx 已经带了更短的截止时间，则直接复用，避免放大超时窗口。
+var (
+	RedisRepositoryTimeout = defaultRedisRepositoryTimeout
+	ScheduledTaskTimeout   = defaultScheduledTaskTimeout
+	ScheduledTaskLockTTL   = defaultScheduledTaskLockTTL
+	CreateLockTTL          = defaultCreateLockTTL
+)
+
 func WithOperationTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	// 已经有更短 deadline 的上游 context 不再额外包一层，
+	// 避免把真实调用超时意外放宽。
 	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		if time.Until(deadline) <= timeout {
-			return ctx, func() {}
-		}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
+		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)
+}
+
+func WithScheduledTaskTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	// 调度重算统一走单独超时，避免后台任务无限占用连接和锁。
+	return WithOperationTimeout(ctx, ScheduledTaskTimeout)
 }

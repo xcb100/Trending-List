@@ -11,16 +11,7 @@
 
 # Context
 
-高风险：GetLeaderboard 恢复逻辑错误吞掉太多上下文
-当前 GetLeaderboard 返回 *Leaderboard，没有 error。恢复失败时只能 fmt.Printf 后返回 nil，调用方无法区分“没找到”还是“恢复失败”。建议改为 (*Leaderboard, error)，至少分离 ErrNotFound。
-中风险：Recompute 批处理遇错继续但最终仍返回 nil
-在批量重算中，多处 continue + fmt.Printf，最后可能“部分失败但对外成功”。建议累计错误并返回（例如 multierr 或自定义统计错误），避免静默数据不一致。
-中风险：日志使用 fmt.Printf，不利于生产排障
-Recompute/GetTopN/恢复路径均直接打印。建议统一成结构化 logger（至少带 leaderboard_id,item_id,batch）。
-中风险：时间相关表达式不易测试稳定
-getEnv 中 now 直接取 time.Now().Unix()，测试会抖动。建议注入时钟函数（nowFunc）以便 deterministic test。
-低风险：命名风格
-LB_Mu 不符合 Go 常见风格（lbMu），可读性问题，不影响功能。
+
 # 准则（必须遵守）
 项目每一个目录下都需要有一个Context.md文件，这是你在项目进程中必须遵守的准则。
 在创建目录时需要创建一个Context.md文件，里面没有本文档的# 准则模块，只有Context，一开始是空的

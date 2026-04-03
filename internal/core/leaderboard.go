@@ -17,13 +17,10 @@ import (
 )
 
 const (
-	// RefreshPolicyRealtime 表示写入后立即重算分数。
-	RefreshPolicyRealtime = "realtime"
-	// RefreshPolicyScheduled 表示写入后只标记脏数据，由定时任务或手动触发重算。
+	RefreshPolicyRealtime  = "realtime"
 	RefreshPolicyScheduled = "scheduled"
 )
 
-// Item 表示排行榜中的单个条目。
 type Item struct {
 	ID        string                 `json:"id"`
 	Data      map[string]interface{} `json:"data"`
@@ -31,14 +28,13 @@ type Item struct {
 	UpdatedAt time.Time              `json:"updated_at"`
 }
 
-// DataPayload 用于在 Redis Hash 中存储的数据结构。
 type DataPayload struct {
 	Data      map[string]interface{} `json:"data"`
 	UpdatedAt time.Time              `json:"updated_at"`
 }
 
-// Leaderboard 管理条目和排序逻辑。
 type Leaderboard struct {
+	mu               sync.RWMutex
 	ID               string
 	Expression       string
 	Schema           map[string]interface{}
@@ -47,6 +43,25 @@ type Leaderboard struct {
 	LastRecomputedAt time.Time
 	program          *vm.Program
 	repo             Repository
+}
+
+type leaderboardSnapshot struct {
+	ID               string
+	Expression       string
+	Schema           map[string]interface{}
+	RefreshPolicy    string
+	CronSpec         string
+	LastRecomputedAt time.Time
+	program          *vm.Program
+}
+
+type LeaderboardState struct {
+	ID               string                 `json:"id"`
+	Expression       string                 `json:"expression"`
+	Schema           map[string]interface{} `json:"schema"`
+	RefreshPolicy    string                 `json:"refresh_policy"`
+	CronSpec         string                 `json:"cron_spec"`
+	LastRecomputedAt time.Time              `json:"last_recomputed_at"`
 }
 
 var (
@@ -63,8 +78,30 @@ var (
 
 var (
 	ErrLeaderboardNotFound = errors.New("leaderboard not found")
+	ErrLeaderboardExists   = errors.New("leaderboard already exists")
 	ErrRestoreFailed       = errors.New("leaderboard restore failed")
+	ErrRecomputeFailed     = errors.New("leaderboard recompute failed")
+	ErrRecomputeInProgress = errors.New("leaderboard recompute already in progress")
 )
+
+func cloneMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]interface{}, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func leaderboardCreateLockKey(id string) string {
+	return fmt.Sprintf("lb:%s:create_lock", id)
+}
+
+func leaderboardRecomputeLockKey(id string) string {
+	return fmt.Sprintf("lb:%s:recompute_lock", id)
+}
 
 func getEnv(data map[string]interface{}, updatedAt int64) map[string]interface{} {
 	env := envPool.Get().(map[string]interface{})
@@ -74,9 +111,9 @@ func getEnv(data map[string]interface{}, updatedAt int64) map[string]interface{}
 	for k, v := range data {
 		if vFloat, ok := v.(float64); ok {
 			env[k] = vFloat
-		} else {
-			env[k] = v
+			continue
 		}
+		env[k] = v
 	}
 	env["now"] = float64(time.Now().Unix())
 	if _, ok := env["updated_at"]; !ok {
@@ -103,6 +140,7 @@ func normalizeRefreshPolicy(policy string) string {
 func compileProgram(expression string, schema map[string]interface{}) (*vm.Program, error) {
 	validationEnv := getEnv(schema, 0)
 	defer releaseEnv(validationEnv)
+
 	program, err := expr.Compile(expression, expr.Env(validationEnv))
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile ranking expression: %w", err)
@@ -133,34 +171,176 @@ func deserializeSchema(schemaText string) map[string]interface{} {
 }
 
 func metadataFromLeaderboard(lb *Leaderboard) map[string]string {
+	snapshot := lb.snapshot()
+	return metadataFromSnapshot(snapshot)
+}
+
+func metadataFromSnapshot(snapshot leaderboardSnapshot) map[string]string {
 	return map[string]string{
-		"expression":         lb.Expression,
-		"schema":             serializeSchema(lb.Schema),
-		"refresh_policy":     lb.RefreshPolicy,
-		"cron_spec":          lb.CronSpec,
-		"last_recomputed_at": lb.LastRecomputedAt.Format(time.RFC3339Nano),
+		"expression":         snapshot.Expression,
+		"schema":             serializeSchema(snapshot.Schema),
+		"refresh_policy":     snapshot.RefreshPolicy,
+		"cron_spec":          snapshot.CronSpec,
+		"last_recomputed_at": snapshot.LastRecomputedAt.Format(time.RFC3339Nano),
 	}
 }
 
-// CreateLeaderboard 创建一个新的排行榜并在全局注册。
+func (lb *Leaderboard) snapshot() leaderboardSnapshot {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	// 快照会复制当前可变状态，这样调用方可以在释放锁之后安全地执行
+	// Redis IO、算分等耗时操作，避免长时间持有锁。
+	return leaderboardSnapshot{
+		ID:               lb.ID,
+		Expression:       lb.Expression,
+		Schema:           cloneMap(lb.Schema),
+		RefreshPolicy:    lb.RefreshPolicy,
+		CronSpec:         lb.CronSpec,
+		LastRecomputedAt: lb.LastRecomputedAt,
+		program:          lb.program,
+	}
+}
+
+func (lb *Leaderboard) State() LeaderboardState {
+	snapshot := lb.snapshot()
+	return LeaderboardState{
+		ID:               snapshot.ID,
+		Expression:       snapshot.Expression,
+		Schema:           cloneMap(snapshot.Schema),
+		RefreshPolicy:    snapshot.RefreshPolicy,
+		CronSpec:         snapshot.CronSpec,
+		LastRecomputedAt: snapshot.LastRecomputedAt,
+	}
+}
+
+func (lb *Leaderboard) setLastRecomputedAt(ts time.Time) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.LastRecomputedAt = ts
+}
+
+func (lb *Leaderboard) replaceSchedule(policy, cronSpec string) leaderboardSnapshot {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	previous := leaderboardSnapshot{
+		ID:               lb.ID,
+		Expression:       lb.Expression,
+		Schema:           cloneMap(lb.Schema),
+		RefreshPolicy:    lb.RefreshPolicy,
+		CronSpec:         lb.CronSpec,
+		LastRecomputedAt: lb.LastRecomputedAt,
+		program:          lb.program,
+	}
+
+	lb.RefreshPolicy = policy
+	lb.CronSpec = cronSpec
+	return previous
+}
+
+func (lb *Leaderboard) restoreFromSnapshot(snapshot leaderboardSnapshot) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.Expression = snapshot.Expression
+	lb.Schema = cloneMap(snapshot.Schema)
+	lb.RefreshPolicy = snapshot.RefreshPolicy
+	lb.CronSpec = snapshot.CronSpec
+	lb.LastRecomputedAt = snapshot.LastRecomputedAt
+	lb.program = snapshot.program
+}
+
+func (lb *Leaderboard) replaceExpression(expression string, schema map[string]interface{}, program *vm.Program) leaderboardSnapshot {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	previous := leaderboardSnapshot{
+		ID:               lb.ID,
+		Expression:       lb.Expression,
+		Schema:           cloneMap(lb.Schema),
+		RefreshPolicy:    lb.RefreshPolicy,
+		CronSpec:         lb.CronSpec,
+		LastRecomputedAt: lb.LastRecomputedAt,
+		program:          lb.program,
+	}
+
+	lb.Expression = expression
+	lb.Schema = cloneMap(schema)
+	lb.program = program
+	return previous
+}
+
+func ensureLeaderboardDoesNotExist(ctx context.Context, id string, repo Repository) error {
+	lbMu.RLock()
+	_, existsInMemory := Leaderboards[id]
+	lbMu.RUnlock()
+	if existsInMemory {
+		return fmt.Errorf("%w: id=%s", ErrLeaderboardExists, id)
+	}
+
+	meta, err := repo.GetMetadata(ctx, id)
+	if err != nil {
+		return fmt.Errorf("check leaderboard conflict: %w", err)
+	}
+	if len(meta) > 0 {
+		return fmt.Errorf("%w: id=%s", ErrLeaderboardExists, id)
+	}
+	return nil
+}
+
 func CreateLeaderboard(ctx context.Context, id, expression string, schema map[string]interface{}, refreshPolicy string, cronSpec string, repo Repository) (*Leaderboard, error) {
+	if repo == nil {
+		recordCreate("error")
+		return nil, fmt.Errorf("repository is required")
+	}
+
+	// 这里使用一个短时 Redis 锁，缩小“冲突检查”和“写入元数据”之间的时间窗，
+	// 避免多实例并发创建同一个排行榜时互相覆盖。
+	locked, err := repo.AcquireLock(ctx, leaderboardCreateLockKey(id), CreateLockTTL)
+	if err != nil {
+		recordCreate("error")
+		return nil, fmt.Errorf("acquire create lock: %w", err)
+	}
+	if !locked {
+		recordCreate("conflict")
+		return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardExists, id)
+	}
+	defer func() {
+		if err := repo.ReleaseLock(ctx, leaderboardCreateLockKey(id)); err != nil {
+			coreLogger.Warn("release create lock failed", "leaderboard_id", id, "error", err)
+		}
+	}()
+
+	if err := ensureLeaderboardDoesNotExist(ctx, id, repo); err != nil {
+		if errors.Is(err, ErrLeaderboardExists) {
+			recordCreate("conflict")
+		} else {
+			recordCreate("error")
+		}
+		return nil, err
+	}
+
 	policy := normalizeRefreshPolicy(refreshPolicy)
 	if policy == "" {
+		recordCreate("error")
 		return nil, fmt.Errorf("invalid refresh policy: %s", refreshPolicy)
 	}
-	if policy == RefreshPolicyScheduled && cronSpec == "" {
-		return nil, fmt.Errorf("cron_spec is required when refresh_policy is scheduled")
+	if policy == RefreshPolicyScheduled {
+		if err := ValidateCronSpec(cronSpec); err != nil {
+			recordCreate("error")
+			return nil, err
+		}
 	}
 
 	program, err := compileProgram(expression, schema)
 	if err != nil {
+		recordCreate("error")
 		return nil, err
 	}
 
 	lb := &Leaderboard{
 		ID:            id,
 		Expression:    expression,
-		Schema:        schema,
+		Schema:        cloneMap(schema),
 		RefreshPolicy: policy,
 		CronSpec:      cronSpec,
 		program:       program,
@@ -168,32 +348,36 @@ func CreateLeaderboard(ctx context.Context, id, expression string, schema map[st
 	}
 
 	if err := repo.SaveMetadata(ctx, id, metadataFromLeaderboard(lb)); err != nil {
+		recordCreate("error")
 		return nil, fmt.Errorf("failed to save leaderboard metadata: %w", err)
 	}
 
-	// 核心优化：维护定向梯队子集，避免后台定时器进行高昂的全局扫表
 	if policy == RefreshPolicyScheduled {
-		tier := DetermineTier(cronSpec)
-		_ = repo.AddScheduledLeaderboard(ctx, id, tier)
+		if err := repo.AddScheduledLeaderboard(ctx, id, DetermineTier(cronSpec)); err != nil {
+			recordCreate("error")
+			return nil, fmt.Errorf("failed to register scheduled leaderboard: %w", err)
+		}
 	} else {
-		_ = repo.RemoveScheduledLeaderboard(ctx, id)
+		if err := repo.RemoveScheduledLeaderboard(ctx, id); err != nil {
+			recordCreate("error")
+			return nil, fmt.Errorf("failed to unregister scheduled leaderboard: %w", err)
+		}
 	}
 
 	lbMu.Lock()
 	Leaderboards[id] = lb
 	lbMu.Unlock()
 
+	recordCreate("success")
 	return lb, nil
 }
 
-// DefaultRepo 用于在运行时恢复排行榜实例。
 var DefaultRepo Repository
 
 func SetDefaultRepo(repo Repository) {
 	DefaultRepo = repo
 }
 
-// GetLeaderboard 获取排行榜实例；如果内存中不存在，则尝试从仓储恢复。
 func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
 	lbMu.RLock()
 	lb, ok := Leaderboards[id]
@@ -205,7 +389,9 @@ func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
 		return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardNotFound, id)
 	}
 
-	v, err, _ := restoreGroup.Do(id, func() (interface{}, error) {
+	value, err, _ := restoreGroup.Do(id, func() (interface{}, error) {
+		// singleflight 用来收敛同一个排行榜的并发冷恢复，
+		// 避免重复读取元数据和重复编译表达式。
 		lbMu.RLock()
 		existing, exists := Leaderboards[id]
 		lbMu.RUnlock()
@@ -225,12 +411,18 @@ func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
 		if expression == "" {
 			return nil, fmt.Errorf("%w: id=%s empty expression", ErrRestoreFailed, id)
 		}
+
 		schema := deserializeSchema(meta["schema"])
 		policy := normalizeRefreshPolicy(meta["refresh_policy"])
 		if policy == "" {
 			policy = RefreshPolicyRealtime
 		}
 		cronSpec := meta["cron_spec"]
+		if policy == RefreshPolicyScheduled {
+			if validateErr := ValidateCronSpec(cronSpec); validateErr != nil {
+				return nil, fmt.Errorf("%w: id=%s invalid cron spec: %v", ErrRestoreFailed, id, validateErr)
+			}
+		}
 
 		program, compileErr := compileProgram(expression, schema)
 		if compileErr != nil {
@@ -246,6 +438,7 @@ func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
 			program:       program,
 			repo:          DefaultRepo,
 		}
+
 		if lastRecomputedAt := meta["last_recomputed_at"]; lastRecomputedAt != "" {
 			if ts, parseErr := time.Parse(time.RFC3339Nano, lastRecomputedAt); parseErr == nil {
 				restored.LastRecomputedAt = ts
@@ -263,21 +456,31 @@ func GetLeaderboard(ctx context.Context, id string) (*Leaderboard, error) {
 	})
 	if err != nil {
 		if errors.Is(err, ErrLeaderboardNotFound) {
+			recordRestore("not_found")
 			return nil, err
 		}
+		recordRestore("error")
 		coreLogger.Error("leaderboard restore failed", "leaderboard_id", id, "error", err)
 		return nil, err
 	}
-	if v == nil {
+	if value == nil {
+		recordRestore("not_found")
 		return nil, fmt.Errorf("%w: id=%s", ErrLeaderboardNotFound, id)
 	}
-	return v.(*Leaderboard), nil
+	recordRestore("success")
+	return value.(*Leaderboard), nil
 }
 
 func (lb *Leaderboard) evaluateScore(data map[string]interface{}, updatedAt time.Time) (float64, error) {
+	snapshot := lb.snapshot()
+	return evaluateScoreWithProgram(snapshot.program, data, updatedAt)
+}
+
+func evaluateScoreWithProgram(program *vm.Program, data map[string]interface{}, updatedAt time.Time) (float64, error) {
 	env := getEnv(data, updatedAt.Unix())
 	defer releaseEnv(env)
-	output, err := expr.Run(lb.program, env)
+
+	output, err := expr.Run(program, env)
 	if err != nil {
 		return 0, fmt.Errorf("failed to evaluate score: %w", err)
 	}
@@ -302,16 +505,19 @@ func (lb *Leaderboard) evaluateScore(data map[string]interface{}, updatedAt time
 	}
 }
 
-// UpsertItem 添加或更新排行榜中的条目。
 func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[string]interface{}) (*Item, error) {
+	snapshot := lb.snapshot()
 	ts := time.Now()
-	if lb.RefreshPolicy == RefreshPolicyScheduled {
-		if err := lb.repo.SaveItemData(ctx, lb.ID, id, data, ts); err != nil {
+	if snapshot.RefreshPolicy == RefreshPolicyScheduled {
+		if err := lb.repo.SaveItemData(ctx, snapshot.ID, id, data, ts); err != nil {
+			recordUpsert(snapshot.RefreshPolicy, "error")
 			return nil, fmt.Errorf("failed to save item data: %w", err)
 		}
-		if err := lb.repo.MarkItemDirty(ctx, lb.ID, id, true); err != nil {
+		if err := lb.repo.MarkItemDirty(ctx, snapshot.ID, id, true); err != nil {
+			recordUpsert(snapshot.RefreshPolicy, "error")
 			return nil, fmt.Errorf("failed to mark item dirty: %w", err)
 		}
+		recordUpsert(snapshot.RefreshPolicy, "success")
 		return &Item{
 			ID:        id,
 			Data:      data,
@@ -320,56 +526,116 @@ func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[strin
 		}, nil
 	}
 
-	score, err := lb.evaluateScore(data, ts)
+	score, err := evaluateScoreWithProgram(snapshot.program, data, ts)
 	if err != nil {
+		recordUpsert(snapshot.RefreshPolicy, "error")
 		return nil, err
 	}
-	if err := lb.repo.UpsertItem(ctx, lb.ID, id, score, data, ts); err != nil {
+	if err := lb.repo.UpsertItem(ctx, snapshot.ID, id, score, data, ts); err != nil {
+		recordUpsert(snapshot.RefreshPolicy, "error")
 		return nil, fmt.Errorf("failed to upsert item: %w", err)
 	}
+	recordUpsert(snapshot.RefreshPolicy, "success")
 	return &Item{ID: id, Data: data, Score: score, UpdatedAt: ts}, nil
 }
 
-// Recompute 重新计算 dirty 条目的分数。
 func (lb *Leaderboard) Recompute(ctx context.Context) error {
+	return lb.recompute(ctx, "manual", true)
+}
+
+func (lb *Leaderboard) recompute(ctx context.Context, trigger string, failOnLocked bool) error {
+	snapshot := lb.snapshot()
+	startedAt := time.Now()
+
+	// 手动重算和调度重算共用同一把锁，保证同一个排行榜在多实例下
+	// 同时最多只有一个批量重算任务在执行。
+	locked, err := lb.repo.AcquireLock(ctx, leaderboardRecomputeLockKey(snapshot.ID), ScheduledTaskLockTTL)
+	if err != nil {
+		recordRecompute(trigger, "error", time.Since(startedAt))
+		return fmt.Errorf("acquire recompute lock: %w", err)
+	}
+	if !locked {
+		status := "skipped_locked"
+		if failOnLocked {
+			status = "in_progress"
+		}
+		recordRecompute(trigger, status, time.Since(startedAt))
+		if failOnLocked {
+			return fmt.Errorf("%w: leaderboard_id=%s", ErrRecomputeInProgress, snapshot.ID)
+		}
+		return nil
+	}
+	defer func() {
+		if err := lb.repo.ReleaseLock(ctx, leaderboardRecomputeLockKey(snapshot.ID)); err != nil {
+			coreLogger.Warn("release recompute lock failed", "leaderboard_id", snapshot.ID, "error", err)
+		}
+	}()
+
 	cursor := uint64(0)
+	var failureCount int
 	for {
-		var batchIDs []string
-		var err error
-		// 1. 采用 SSCAN 分批拉取替代 SMEMBERS，杜绝 1000 万级脏数据引发内存 OOM
-		batchIDs, cursor, err = lb.repo.ScanDirtyItemIDs(ctx, lb.ID, cursor, 500)
+		batchIDs, nextCursor, err := lb.repo.ScanDirtyItemIDs(ctx, snapshot.ID, cursor, 500)
 		if err != nil {
+			recordRecompute(trigger, "error", time.Since(startedAt))
 			return fmt.Errorf("failed to scan dirty items: %w", err)
 		}
+		cursor = nextCursor
 
 		if len(batchIDs) > 0 {
-			items, err := lb.repo.GetItems(ctx, lb.ID, batchIDs)
+			items, err := lb.repo.GetItems(ctx, snapshot.ID, batchIDs)
 			if err != nil {
-				coreLogger.Error("batch read items failed", "leaderboard_id", lb.ID, "error", err)
+				coreLogger.Error("batch read items failed", "leaderboard_id", snapshot.ID, "error", err)
+				failureCount++
+				if cursor == 0 {
+					break
+				}
 				continue
+			}
+
+			resolvedIDs := make(map[string]struct{}, len(items))
+			for _, item := range items {
+				if item != nil {
+					resolvedIDs[item.ID] = struct{}{}
+				}
+			}
+
+			var unresolvedIDs []string
+			for _, id := range batchIDs {
+				if _, ok := resolvedIDs[id]; !ok {
+					unresolvedIDs = append(unresolvedIDs, id)
+				}
+			}
+			// dirty 标记可能在源数据被删除或损坏后残留，
+			// 这里顺手清理，避免这些条目长期卡在待重算集合里。
+			if len(unresolvedIDs) > 0 {
+				if err := lb.repo.PruneItems(ctx, snapshot.ID, unresolvedIDs); err != nil {
+					coreLogger.Error("prune unresolved dirty items failed", "leaderboard_id", snapshot.ID, "count", len(unresolvedIDs), "error", err)
+					failureCount++
+				}
 			}
 
 			scores := make(map[string]float64)
 			updatedAts := make(map[string]time.Time)
-
 			for _, item := range items {
 				if item == nil {
 					continue
 				}
-				score, err := lb.evaluateScore(item.Data, item.UpdatedAt)
+				score, err := evaluateScoreWithProgram(snapshot.program, item.Data, item.UpdatedAt)
 				if err != nil {
-					coreLogger.Error("recompute item score failed", "leaderboard_id", lb.ID, "item_id", item.ID, "error", err)
+					coreLogger.Error("recompute item score failed", "leaderboard_id", snapshot.ID, "item_id", item.ID, "error", err)
+					failureCount++
 					continue
 				}
 				scores[item.ID] = score
-				// 记录计算时的锚点时间，用于防并发覆盖
 				updatedAts[item.ID] = item.UpdatedAt
 			}
 
 			if len(scores) > 0 {
-				// 2. 剥弃 UpdateItemsScores + ClearDirtyItemIDs 极易引发竞态丢失的组合，改用基于 Lua 的单边聚合方法
-				if err := lb.repo.CommitRecomputedScores(ctx, lb.ID, scores, updatedAts); err != nil {
-					coreLogger.Error("batch atomic commit scores failed", "leaderboard_id", lb.ID, "error", err)
+				// CommitRecomputedScores 会校验当前存储里的 updated_at，
+				// 防止较早启动的重算结果覆盖后来更新过的数据。
+				if err := lb.repo.CommitRecomputedScores(ctx, snapshot.ID, scores, updatedAts); err != nil {
+					coreLogger.Error("batch atomic commit scores failed", "leaderboard_id", snapshot.ID, "error", err)
+					failureCount++
 				}
 			}
 		}
@@ -379,20 +645,191 @@ func (lb *Leaderboard) Recompute(ctx context.Context) error {
 		}
 	}
 
-	lb.LastRecomputedAt = time.Now()
-	if err := lb.repo.SaveMetadata(ctx, lb.ID, metadataFromLeaderboard(lb)); err != nil {
+	if failureCount > 0 {
+		recordRecompute(trigger, "error", time.Since(startedAt))
+		return fmt.Errorf("%w: leaderboard_id=%s failure_count=%d", ErrRecomputeFailed, snapshot.ID, failureCount)
+	}
+
+	lb.setLastRecomputedAt(time.Now())
+	if err := lb.repo.SaveMetadata(ctx, snapshot.ID, metadataFromLeaderboard(lb)); err != nil {
+		recordRecompute(trigger, "error", time.Since(startedAt))
 		return fmt.Errorf("failed to update recompute metadata: %w", err)
 	}
+	recordRecompute(trigger, "success", time.Since(startedAt))
 	return nil
 }
 
-// GetTopN 返回分数最高的前 N 个条目。
-func (lb *Leaderboard) GetTopN(ctx context.Context, n int) []*Item {
-	items, err := lb.repo.GetTopN(ctx, lb.ID, n)
+func (lb *Leaderboard) GetTopN(ctx context.Context, n int) ([]*Item, error) {
+	snapshot := lb.snapshot()
+	items, err := lb.repo.GetTopN(ctx, snapshot.ID, n)
 	if err != nil {
-		coreLogger.Error("get topN failed", "leaderboard_id", lb.ID, "n", n, "error", err)
-		return []*Item{}
+		return nil, fmt.Errorf("get topN: %w", err)
+	}
+	return items, nil
+}
+
+func UpdateLeaderboardSchedule(ctx context.Context, lb *Leaderboard, cronSpec string) error {
+	if err := ValidateCronSpec(cronSpec); err != nil {
+		return err
 	}
 
-	return items
+	previous := lb.replaceSchedule(RefreshPolicyScheduled, cronSpec)
+	current := lb.snapshot()
+
+	if err := lb.repo.SaveMetadata(ctx, current.ID, metadataFromSnapshot(current)); err != nil {
+		lb.restoreFromSnapshot(previous)
+		return fmt.Errorf("failed to save schedule metadata: %w", err)
+	}
+
+	if err := lb.repo.AddScheduledLeaderboard(ctx, current.ID, DetermineTier(cronSpec)); err != nil {
+		lb.restoreFromSnapshot(previous)
+		_ = lb.repo.SaveMetadata(ctx, current.ID, metadataFromSnapshot(previous))
+		if previous.RefreshPolicy == RefreshPolicyScheduled && previous.CronSpec != "" {
+			_ = lb.repo.AddScheduledLeaderboard(ctx, current.ID, DetermineTier(previous.CronSpec))
+		} else {
+			_ = lb.repo.RemoveScheduledLeaderboard(ctx, current.ID)
+		}
+		return fmt.Errorf("failed to register scheduled leaderboard: %w", err)
+	}
+
+	return nil
+}
+
+func DeleteLeaderboard(ctx context.Context, id string) error {
+	lb, err := GetLeaderboard(ctx, id)
+	if err != nil {
+		recordDeleteLeaderboard("error")
+		return err
+	}
+	if err := lb.repo.DeleteLeaderboard(ctx, id); err != nil {
+		recordDeleteLeaderboard("error")
+		return fmt.Errorf("delete leaderboard: %w", err)
+	}
+
+	lbMu.Lock()
+	delete(Leaderboards, id)
+	lbMu.Unlock()
+	recordDeleteLeaderboard("success")
+	return nil
+}
+
+func (lb *Leaderboard) DeleteItem(ctx context.Context, itemID string) error {
+	snapshot := lb.snapshot()
+	if err := lb.repo.DeleteItem(ctx, snapshot.ID, itemID); err != nil {
+		recordDeleteItem("error")
+		return fmt.Errorf("delete item: %w", err)
+	}
+	recordDeleteItem("success")
+	return nil
+}
+
+func UpdateLeaderboardExpression(ctx context.Context, lb *Leaderboard, expression string, schema map[string]interface{}) error {
+	startedAt := time.Now()
+	if expression == "" {
+		recordExpressionUpdate("error", time.Since(startedAt))
+		return fmt.Errorf("expression is required")
+	}
+
+	snapshot := lb.snapshot()
+	nextSchema := snapshot.Schema
+	if schema != nil {
+		nextSchema = schema
+	}
+
+	program, err := compileProgram(expression, nextSchema)
+	if err != nil {
+		recordExpressionUpdate("error", time.Since(startedAt))
+		return err
+	}
+
+	locked, err := lb.repo.AcquireLock(ctx, leaderboardRecomputeLockKey(snapshot.ID), ScheduledTaskLockTTL)
+	if err != nil {
+		recordExpressionUpdate("error", time.Since(startedAt))
+		return fmt.Errorf("acquire recompute lock: %w", err)
+	}
+	if !locked {
+		recordExpressionUpdate("in_progress", time.Since(startedAt))
+		return fmt.Errorf("%w: leaderboard_id=%s", ErrRecomputeInProgress, snapshot.ID)
+	}
+	defer func() {
+		if err := lb.repo.ReleaseLock(ctx, leaderboardRecomputeLockKey(snapshot.ID)); err != nil {
+			coreLogger.Warn("release recompute lock failed after expression update", "leaderboard_id", snapshot.ID, "error", err)
+		}
+	}()
+
+	previous := lb.replaceExpression(expression, nextSchema, program)
+	current := lb.snapshot()
+
+	// 表达式会先在内存里尝试切换，但同时保留旧快照，
+	// 这样全量重算失败时可以完整回滚。
+	if err := lb.recomputeAllItems(ctx); err != nil {
+		lb.restoreFromSnapshot(previous)
+		recordExpressionUpdate("error", time.Since(startedAt))
+		return err
+	}
+	lb.setLastRecomputedAt(time.Now())
+	current = lb.snapshot()
+
+	if err := lb.repo.SaveMetadata(ctx, current.ID, metadataFromSnapshot(current)); err != nil {
+		lb.restoreFromSnapshot(previous)
+		recordExpressionUpdate("error", time.Since(startedAt))
+		return fmt.Errorf("save updated expression metadata: %w", err)
+	}
+
+	recordExpressionUpdate("success", time.Since(startedAt))
+	return nil
+}
+
+func (lb *Leaderboard) recomputeAllItems(ctx context.Context) error {
+	snapshot := lb.snapshot()
+	const batchSize = 500
+
+	scores := make(map[string]float64, batchSize)
+	dirtyIDs := make([]string, 0, batchSize)
+	var failureCount int
+
+	flush := func() error {
+		if len(scores) == 0 {
+			return nil
+		}
+		// 按批次落盘，避免全量表达式刷新时把所有重算结果一直堆在内存里。
+		if err := lb.repo.UpdateItemsScores(ctx, snapshot.ID, scores); err != nil {
+			return err
+		}
+		if err := lb.repo.ClearDirtyItemIDs(ctx, snapshot.ID, dirtyIDs); err != nil {
+			return err
+		}
+		clear(scores)
+		dirtyIDs = dirtyIDs[:0]
+		return nil
+	}
+
+	err := lb.repo.IterateItems(ctx, snapshot.ID, func(item *Item) bool {
+		score, err := evaluateScoreWithProgram(snapshot.program, item.Data, item.UpdatedAt)
+		if err != nil {
+			failureCount++
+			coreLogger.Error("recompute all item score failed", "leaderboard_id", snapshot.ID, "item_id", item.ID, "error", err)
+			return true
+		}
+		scores[item.ID] = score
+		dirtyIDs = append(dirtyIDs, item.ID)
+		if len(scores) >= batchSize {
+			if err := flush(); err != nil {
+				failureCount++
+				coreLogger.Error("flush recomputed scores failed", "leaderboard_id", snapshot.ID, "error", err)
+				return false
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("iterate items for recompute: %w", err)
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("flush recomputed scores: %w", err)
+	}
+	if failureCount > 0 {
+		return fmt.Errorf("%w: leaderboard_id=%s failure_count=%d", ErrRecomputeFailed, snapshot.ID, failureCount)
+	}
+	return nil
 }

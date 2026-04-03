@@ -9,3 +9,5 @@ vendor/
 .idea/
 .vscode/
 awesomeProject.exe
+.gocache/
+.gotmp/

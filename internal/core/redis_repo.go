@@ -56,7 +56,29 @@ func (r *RedisRepository) SaveMetadata(ctx context.Context, lbID string, metadat
 	for k, v := range metadata {
 		values = append(values, k, v)
 	}
+
 	return r.client.HSet(ctx, r.metadataKey(lbID), values...).Err()
+}
+
+func (r *RedisRepository) DeleteLeaderboard(ctx context.Context, lbID string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	keys := []string{
+		r.metadataKey(lbID),
+		r.itemsKey(lbID),
+		r.scoresKey(lbID),
+		r.dirtyKey(lbID),
+	}
+
+	pipe := r.client.TxPipeline()
+	// 删除排行榜时同时清理所有 tier 索引，避免调度器继续扫描已删除榜单。
+	pipe.Del(ctx, keys...)
+	for _, tier := range allTiers {
+		pipe.SRem(ctx, scheduledTierKey(tier), lbID)
+	}
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (r *RedisRepository) saveItemWithPayload(ctx context.Context, lbID string, itemID string, data map[string]interface{}, updatedAt time.Time) error {
@@ -88,11 +110,24 @@ func (r *RedisRepository) UpsertItem(ctx context.Context, lbID string, itemID st
 		return err
 	}
 
-	pipe := r.client.Pipeline()
+	pipe := r.client.TxPipeline()
+	// 实时榜写入需要同时更新原始数据、分数和 dirty 状态，保持读路径一致。
 	pipe.HSet(ctx, r.itemsKey(lbID), itemID, payloadBytes)
 	pipe.ZAdd(ctx, r.scoresKey(lbID), redis.Z{Score: score, Member: itemID})
 	pipe.SRem(ctx, r.dirtyKey(lbID), itemID)
 	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func (r *RedisRepository) DeleteItem(ctx context.Context, lbID string, itemID string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	pipe := r.client.TxPipeline()
+	pipe.HDel(ctx, r.itemsKey(lbID), itemID)
+	pipe.ZRem(ctx, r.scoresKey(lbID), itemID)
+	pipe.SRem(ctx, r.dirtyKey(lbID), itemID)
+	_, err := pipe.Exec(ctx)
 	return err
 }
 
@@ -112,6 +147,12 @@ func (r *RedisRepository) AcquireLock(ctx context.Context, key string, ttl time.
 	return r.client.SetNX(ctx, key, "1", ttl).Result()
 }
 
+func (r *RedisRepository) ReleaseLock(ctx context.Context, key string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+	return r.client.Del(ctx, key).Err()
+}
+
 func (r *RedisRepository) GetAllLeaderboardIDs(ctx context.Context) ([]string, error) {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
@@ -119,9 +160,7 @@ func (r *RedisRepository) GetAllLeaderboardIDs(ctx context.Context) ([]string, e
 	var ids []string
 	var cursor uint64
 	for {
-		var keys []string
-		var err error
-		keys, cursor, err = r.client.Scan(ctx, cursor, "lb:*:meta", 100).Result()
+		keys, nextCursor, err := r.client.Scan(ctx, cursor, "lb:*:meta", 100).Result()
 		if err != nil {
 			return nil, err
 		}
@@ -131,6 +170,7 @@ func (r *RedisRepository) GetAllLeaderboardIDs(ctx context.Context) ([]string, e
 				ids = append(ids, parts[1])
 			}
 		}
+		cursor = nextCursor
 		if cursor == 0 {
 			break
 		}
@@ -154,20 +194,27 @@ func scheduledTierKey(tier string) string {
 func (r *RedisRepository) AddScheduledLeaderboard(ctx context.Context, lbID string, tier string) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
-	// 先从所有层级中移除，防止因更新频率导致在多个 SET 中重复存在
+
+	pipe := r.client.TxPipeline()
+	// 一个榜单同一时刻只应该存在于一个调度分层里，因此先全量移除再加入目标 tier。
 	for _, t := range allTiers {
-		r.client.SRem(ctx, scheduledTierKey(t), lbID)
+		pipe.SRem(ctx, scheduledTierKey(t), lbID)
 	}
-	return r.client.SAdd(ctx, scheduledTierKey(tier), lbID).Err()
+	pipe.SAdd(ctx, scheduledTierKey(tier), lbID)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (r *RedisRepository) RemoveScheduledLeaderboard(ctx context.Context, lbID string) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
+
+	pipe := r.client.TxPipeline()
 	for _, t := range allTiers {
-		r.client.SRem(ctx, scheduledTierKey(t), lbID)
+		pipe.SRem(ctx, scheduledTierKey(t), lbID)
 	}
-	return nil
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (r *RedisRepository) GetScheduledLeaderboardIDs(ctx context.Context, tier string) ([]string, error) {
@@ -182,6 +229,8 @@ func (r *RedisRepository) ScanDirtyItemIDs(ctx context.Context, lbID string, cur
 	return r.client.SScan(ctx, r.dirtyKey(lbID), cursor, "", count).Result()
 }
 
+// commitRecomputeScript 只有在存储中的 payload 仍然匹配预期 updated_at 时
+// 才会更新分数，避免延迟到达的重算批次覆盖更新后的新数据。
 const commitRecomputeScript = `
 local itemsKey = KEYS[1]
 local scoresKey = KEYS[2]
@@ -191,18 +240,15 @@ for i=1, #ARGV, 3 do
     local itemID = ARGV[i]
     local score = tonumber(ARGV[i+1])
     local expectedTS = ARGV[i+2]
-    
+
     local payload = redis.call('HGET', itemsKey, itemID)
     if payload then
         local matchStr = '"updated_at":' .. expectedTS
-        -- 利用 Lua 原生字符串搜索平替高昂的 cjson.decode 序列化开销
         if string.find(payload, matchStr, 1, true) then
             redis.call('ZADD', scoresKey, score, itemID)
             redis.call('SREM', dirtyKey, itemID)
         end
-        -- 如果没查到该时间戳，说明期间有新数据到达（ABA问题被打破），中止清除打回原位等下轮
     else
-        -- 源数据已丢失，强行修剪废弃脏标记与分数
         redis.call('SREM', dirtyKey, itemID)
         redis.call('ZREM', scoresKey, itemID)
     end
@@ -218,10 +264,12 @@ func (r *RedisRepository) CommitRecomputedScores(ctx context.Context, lbID strin
 		return nil
 	}
 
-	var args []interface{}
+	args := make([]interface{}, 0, len(scores)*3)
 	for id, score := range scores {
-		ts := updatedAts[id]
-		rawJSON, _ := ts.MarshalJSON() // 将输出类似 `"2026-..."`
+		rawJSON, err := updatedAts[id].MarshalJSON()
+		if err != nil {
+			return fmt.Errorf("marshal updated_at for %s: %w", id, err)
+		}
 		args = append(args, id, score, string(rawJSON))
 	}
 
@@ -231,14 +279,36 @@ func (r *RedisRepository) CommitRecomputedScores(ctx context.Context, lbID strin
 func (r *RedisRepository) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
+
 	if len(itemIDs) == 0 {
 		return nil
 	}
+
 	args := make([]interface{}, len(itemIDs))
 	for i, id := range itemIDs {
 		args[i] = id
 	}
 	return r.client.SRem(ctx, r.dirtyKey(lbID), args...).Err()
+}
+
+func (r *RedisRepository) PruneItems(ctx context.Context, lbID string, itemIDs []string) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	if len(itemIDs) == 0 {
+		return nil
+	}
+
+	args := make([]interface{}, len(itemIDs))
+	for i, id := range itemIDs {
+		args[i] = id
+	}
+
+	pipe := r.client.TxPipeline()
+	pipe.SRem(ctx, r.dirtyKey(lbID), args...)
+	pipe.ZRem(ctx, r.scoresKey(lbID), args...)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (r *RedisRepository) GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, error) {
@@ -251,10 +321,7 @@ func (r *RedisRepository) GetItem(ctx context.Context, lbID string, itemID strin
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
 
-	itemsKey := r.itemsKey(lbID)
-	scoresKey := r.scoresKey(lbID)
-
-	payloadJSON, err := r.client.HGet(ctx, itemsKey, itemID).Result()
+	payloadJSON, err := r.client.HGet(ctx, r.itemsKey(lbID), itemID).Result()
 	if err == redis.Nil {
 		return nil, nil
 	}
@@ -267,7 +334,7 @@ func (r *RedisRepository) GetItem(ctx context.Context, lbID string, itemID strin
 		return nil, err
 	}
 
-	score, err := r.client.ZScore(ctx, scoresKey, itemID).Result()
+	score, err := r.client.ZScore(ctx, r.scoresKey(lbID), itemID).Result()
 	if err != nil && err != redis.Nil {
 		return nil, err
 	}
@@ -291,25 +358,24 @@ func (r *RedisRepository) GetItems(ctx context.Context, lbID string, itemIDs []s
 		return []*Item{}, nil
 	}
 
-	itemsKey := r.itemsKey(lbID)
-	payloads, err := r.client.HMGet(ctx, itemsKey, itemIDs...).Result()
+	payloads, err := r.client.HMGet(ctx, r.itemsKey(lbID), itemIDs...).Result()
 	if err != nil && err != redis.Nil {
 		return nil, err
 	}
 
 	result := make([]*Item, 0, len(itemIDs))
-	for i, p := range payloads {
-		if p == nil {
-			continue
-		}
-		jsonStr, ok := p.(string)
+	for i, raw := range payloads {
+		jsonStr, ok := raw.(string)
 		if !ok || jsonStr == "" {
 			continue
 		}
+
 		var payload DataPayload
 		if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
+			// 脏数据在这里跳过，后续由重算流程统一清理对应 dirty 标记和分数。
 			continue
 		}
+
 		result = append(result, &Item{
 			ID:        itemIDs[i],
 			Data:      payload.Data,
@@ -351,33 +417,41 @@ func (r *RedisRepository) GetTopN(ctx context.Context, lbID string, n int) ([]*I
 
 	itemIDs := make([]string, len(zResults))
 	for i, z := range zResults {
-		itemIDs[i] = z.Member.(string)
+		member, ok := z.Member.(string)
+		if !ok {
+			return nil, fmt.Errorf("unexpected member type %T", z.Member)
+		}
+		itemIDs[i] = member
 	}
 
-	jsonDefaults, err := r.client.HMGet(ctx, r.itemsKey(lbID), itemIDs...).Result()
+	rawPayloads, err := r.client.HMGet(ctx, r.itemsKey(lbID), itemIDs...).Result()
 	if err != nil {
 		return nil, err
 	}
 
 	items := make([]*Item, 0, len(zResults))
 	for i, z := range zResults {
-		jsonStr, ok := jsonDefaults[i].(string)
+		jsonStr, ok := rawPayloads[i].(string)
 		if !ok || jsonStr == "" {
 			continue
 		}
 
 		var payload DataPayload
 		if err := json.Unmarshal([]byte(jsonStr), &payload); err != nil {
+			// 排行读取阶段不在这里报错放大，损坏条目会被自然跳过，
+			// 具体清理交给写路径或重算路径处理。
 			continue
 		}
 
+		member, _ := z.Member.(string)
 		items = append(items, &Item{
-			ID:        z.Member.(string),
+			ID:        member,
 			Data:      payload.Data,
 			Score:     z.Score,
 			UpdatedAt: payload.UpdatedAt,
 		})
 	}
+
 	return items, nil
 }
 
@@ -386,6 +460,7 @@ func (r *RedisRepository) IterateItems(ctx context.Context, lbID string, callbac
 	defer cancel()
 
 	iter := r.client.HScan(ctx, r.itemsKey(lbID), 0, "", 0).Iterator()
+	// HSCAN 用于全量重算场景，避免一次性把整张 items hash 全部读入内存。
 	for iter.Next(ctx) {
 		itemID := iter.Val()
 		if !iter.Next(ctx) {
@@ -398,16 +473,15 @@ func (r *RedisRepository) IterateItems(ctx context.Context, lbID string, callbac
 			continue
 		}
 
-		item := &Item{
+		if !callback(&Item{
 			ID:        itemID,
 			Data:      payload.Data,
 			Score:     0,
 			UpdatedAt: payload.UpdatedAt,
-		}
-
-		if !callback(item) {
+		}) {
 			break
 		}
 	}
+
 	return iter.Err()
 }

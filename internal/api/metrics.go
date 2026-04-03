@@ -52,6 +52,8 @@ func MetricsMiddleware(route string, next http.HandlerFunc) http.HandlerFunc {
 		duration := time.Since(start).Seconds()
 		statusStr := strconv.Itoa(rec.statusCode)
 
+		// 这里使用归一化后的 route 标签，而不是原始 URL，
+		// 避免路径参数导致指标基数失控。
 		httpRequestsTotal.WithLabelValues(r.Method, route, statusStr).Inc()
 		httpRequestDuration.WithLabelValues(r.Method, route).Observe(duration)
 	}

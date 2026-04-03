@@ -14,42 +14,39 @@ import (
 )
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	ctx := context.Background()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Redis not running: %v", err)
+		log.Fatalf("redis not running: %v", err)
 	}
 
 	repo := core.NewRedisRepository(rdb)
 	core.SetDefaultRepo(repo)
+	_ = rdb.FlushDB(ctx).Err()
 
-	// 环境清理
-	rdb.FlushDB(ctx)
+	log.Println("=== Automated Cron Scheduler Load Test ===")
 
-	log.Println("=== 自动化内部定时任务压测 (Automated Cron Scheduler Load Test) ===")
-
-	lbID := "cron_lb_100k"
-	schema := map[string]interface{}{"score_base": 0.0}
-
-	// 设置为每 5 秒自动重算一次 (将落入 Tier5s 分级队列)
-	cronSpec := "*/5 * * * * *"
-	expr := "score_base * 5.5 + 10"
-
-	lb, err := core.CreateLeaderboard(ctx, lbID, expr, schema, core.RefreshPolicyScheduled, cronSpec, repo)
+	lb, err := core.CreateLeaderboard(
+		ctx,
+		"cron_lb_100k",
+		"score_base * 5.5 + 10",
+		map[string]interface{}{"score_base": 0.0},
+		core.RefreshPolicyScheduled,
+		"*/5 * * * * *",
+		repo,
+	)
 	if err != nil {
-		log.Fatalf("Failed to create leaderboard: %v", err)
+		log.Fatalf("create leaderboard: %v", err)
 	}
 
 	totalItems := 100000
 	workers := 100
 	itemsPerWorker := totalItems / workers
 
-	log.Printf("1. 正在大规模生成 %d 条设为 Schedule 延迟执行的排名项...", totalItems)
+	log.Printf("writing %d scheduled items...", totalItems)
 	var wg sync.WaitGroup
-	startW := time.Now()
+	startWrite := time.Now()
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -61,59 +58,52 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
-	log.Printf(">> 写入完毕. 耗时: %v", time.Since(startW))
+	log.Printf("write finished in %v", time.Since(startWrite))
 
-	dirtyIDs, _ := repo.GetDirtyItemIDs(ctx, lbID)
-	log.Printf("2. 验证写入后积压的脏数据数量: %d 条", len(dirtyIDs))
-
+	dirtyIDs, _ := repo.GetDirtyItemIDs(ctx, lb.ID)
+	log.Printf("dirty item count after writes: %d", len(dirtyIDs))
 	if len(dirtyIDs) == 0 {
-		log.Fatalf("数据并未正确进入 Dirty 队列，请检查逻辑！")
+		log.Fatal("expected dirty items after scheduled writes")
 	}
 
-	log.Println("3. 启动后台分布式定时调度器 (StartCronScheduler) 并进行观测...")
-
-	cronCtx, cronCancel := context.WithCancel(context.Background())
-	defer cronCancel()
-
-	// 在后台拉起我们的 4 级队列心跳系统
+	cronCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go core.StartCronScheduler(cronCtx)
 
-	// 轮询观测 Redis 脏数据队列的情况
 	timeout := time.After(20 * time.Second)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	processStart := time.Time{}
-
+	var processStart time.Time
 	for {
 		select {
 		case <-timeout:
-			log.Fatalf("超时啦！20秒内调度器未能消化完 %d 条脏任务。", totalItems)
+			log.Fatalf("scheduler did not finish in time for %d items", totalItems)
 		case <-ticker.C:
-			currentDirty, _ := repo.GetDirtyItemIDs(ctx, lbID)
-			count := len(currentDirty)
-
-			if count < totalItems && processStart.IsZero() {
+			currentDirty, _ := repo.GetDirtyItemIDs(ctx, lb.ID)
+			if len(currentDirty) < totalItems && processStart.IsZero() {
 				processStart = time.Now()
-				log.Printf(">> [观测点] 调度器 Cron 滴答已触发，开始吞吐消化批处理...")
+				log.Println("scheduler started consuming dirty items")
+			}
+			if len(currentDirty) != 0 {
+				continue
 			}
 
-			if count == 0 {
-				dur := time.Since(processStart)
-				if dur.Seconds() == 0 {
-					dur = 500 * time.Millisecond // 避免除 0，至少代表是半秒轮询的极速
-				}
-				rps := float64(totalItems) / dur.Seconds()
-				log.Printf(">> [观测点] 调度器清空队列完毕！数据全部重算结账。")
-				log.Printf("=============================================")
-				log.Printf("清算耗时: %v, Cron 批处理估算速度: > %.2f 次/秒", dur, rps)
-
-				top := lb.GetTopN(ctx, 10)
-				if len(top) > 0 {
-					log.Printf("最高排位分数示例: %.2f", top[0].Score)
-				}
-				return
+			duration := time.Since(processStart)
+			if duration <= 0 {
+				duration = 500 * time.Millisecond
 			}
+			rps := float64(totalItems) / duration.Seconds()
+			log.Printf("scheduler finished in %v, estimated throughput %.2f items/s", duration, rps)
+
+			top, err := lb.GetTopN(ctx, 10)
+			if err != nil {
+				log.Fatalf("read topN failed: %v", err)
+			}
+			if len(top) > 0 {
+				log.Printf("top item score: %.2f", top[0].Score)
+			}
+			return
 		}
 	}
 }

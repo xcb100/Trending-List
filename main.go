@@ -3,95 +3,36 @@ package main
 import (
 	"context"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
-	"awesomeProject/internal/api"
-	"awesomeProject/internal/core"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/redis/go-redis/v9"
+	"awesomeProject/internal/app"
+	"awesomeProject/internal/config"
 )
 
 func main() {
-	// Redis 连接配置
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+	// 启动时先完成配置加载，后续所有服务装配都依赖这份运行时配置。
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal("load config:", err)
 	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:         redisAddr,
-		Password:     os.Getenv("REDIS_PASSWORD"),
-		DialTimeout:  1 * time.Second,
-		ReadTimeout:  1 * time.Second,
-		WriteTimeout: 1 * time.Second,
-		PoolTimeout:  2 * time.Second,
-	})
-	defer rdb.Close()
+	application := app.New(cfg)
+	// 用信号驱动主 context，统一控制 HTTP 服务和后台调度器退出。
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	redisRepo := core.NewRedisRepository(rdb)
-	core.SetDefaultRepo(redisRepo)
+	application.Start(runCtx)
+	<-runCtx.Done()
 
-	// ---------------- 配置业务 API 路由 (端口 8080) ----------------
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /leaderboard", api.MetricsMiddleware("/leaderboard", api.CreateLeaderboardHandler))
-	mux.HandleFunc("POST /leaderboard/{id}/item", api.MetricsMiddleware("/leaderboard/{id}/item", api.UpdateItemHandler))
-	mux.HandleFunc("GET /leaderboard/{id}", api.MetricsMiddleware("/leaderboard/{id}", api.GetLeaderboardHandler))
-	mux.HandleFunc("POST /leaderboard/{id}/schedule", api.MetricsMiddleware("/leaderboard/{id}/schedule", api.ScheduleUpdateHandler))
-	mux.HandleFunc("POST /leaderboard/{id}/recompute", api.MetricsMiddleware("/leaderboard/{id}/recompute", api.RecomputeLeaderboardHandler))
-
-	// 全局定时器滴答接口，供 K8s 内部单个定时任务固定唤醒
-	mux.HandleFunc("POST /system/cron/tick", api.MetricsMiddleware("/system/cron/tick", api.SystemCronTickHandler))
-
-	server := &http.Server{
-		Addr:              ":8080",
-		Handler:           mux,
-		ReadHeaderTimeout: 2 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	// ---------------- 配置 Prometheus 监控路由 (内部端口 9090) ----------------
-	// 生产环境最佳实践：将 /metrics 暴露在独立的内部端口，防止外部用户直接访问监控数据造成泄漏
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsServer := &http.Server{
-		Addr:    ":9090",
-		Handler: metricsMux,
-	}
-
-	// Graceful shutdown
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		log.Println("Business API Server listening on :8080")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("Business server error:", err)
-		}
-	}()
-
-	go func() {
-		log.Println("Prometheus Metrics Server listening on :9090")
-		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal("Metrics server error:", err)
-		}
-	}()
-
-	// ---------------- 启动高精度分布式内置定时任务 ----------------
-	go core.StartCronScheduler(context.Background())
-
-	<-stop
 	log.Println("Shutting down...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 关闭阶段使用单独的超时 context，避免某个依赖阻塞导致进程长时间无法退出。
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	server.Shutdown(ctx)
-	metricsServer.Shutdown(ctx)
+	if err := application.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown error: %v", err)
+	}
 }

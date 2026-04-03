@@ -77,7 +77,10 @@ func main() {
 	readStart := time.Now()
 	var topN []*core.Item
 	for i := 0; i < 100; i++ {
-		topN = lb.GetTopN(ctx, 100)
+		topN, err = lb.GetTopN(ctx, 100)
+		if err != nil {
+			log.Fatalf("topN read failed: %v", err)
+		}
 	}
 	readDuration := time.Since(readStart)
 	readRPS := float64(100) / readDuration.Seconds()
@@ -88,6 +91,6 @@ func main() {
 		log.Printf("Top item score: %.2f", topN[0].Score)
 	}
 
-	// Output summary string for capturing
+	// 输出汇总信息，便于外部采集结果
 	fmt.Printf("RESULTS|%d|%.2f|%.2f\n", totalItems, writeRPS, readRPS)
 }
