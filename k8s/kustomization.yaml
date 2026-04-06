@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: leaderboard
 resources:
   - namespace.yaml
+  - redis.yaml
   - configmap.yaml
   - secret.yaml
   - service.yaml

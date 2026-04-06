@@ -28,8 +28,8 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: leaderboard
-          image: your-registry/leaderboard-service:latest
-          imagePullPolicy: IfNotPresent
+          image: jn6057/leaderboard-service:latest
+          imagePullPolicy: Always
           ports:
             - name: business
               containerPort: 8080
