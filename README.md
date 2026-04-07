@@ -18,12 +18,12 @@
 
 
 ## 效果速览（k8s部署下）
-![alt text](3A0A65DD1EB9C2E3D5547230F43E5B3F.png)
+![alt text](assets/3A0A65DD1EB9C2E3D5547230F43E5B3F.png)
 
 环境为1 master，2 node节点集群部署，可得到各接口正常。
 
 
-![alt text](2779C8F8B26579431871B4830C178AC6.png)
+![alt text](assets/2779C8F8B26579431871B4830C178AC6.png)
 ## 刷新模式
 
 ### `realtime`
