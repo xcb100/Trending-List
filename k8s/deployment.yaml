@@ -29,7 +29,7 @@ spec:
       containers:
         - name: leaderboard
           image: jn6057/leaderboard-service:latest
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           ports:
             - name: business
               containerPort: 8080

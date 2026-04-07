@@ -16,6 +16,12 @@
 - Prometheus 指标暴露
 - 容器化与 Kubernetes 清单
 
+> 部署提醒：
+> 如果部署到 Kubernetes，建议把它当作集群内微服务使用，调用时优先走 Service 名称而不是节点 IP。类似业务接口可通过 `leaderboard-service:8080` 访问，Redis 建议使用 `redis:6379`。对于多节点集群，还需要提前确认镜像拉取链路和 CNI 网络插件都正常，否则很容易在部署阶段遇到 `ImagePullBackOff`、Pod 跨节点通信异常、服务名解析失败或 readiness 持续不通过等问题。更具体的处理方式可参考 [k8s/README.md](/c:/Users/Administrator/GolandProjects/awesomeProject/k8s/README.md)。
+
+> 补充说明：
+> 当前提供的是一套基础可运行的 Kubernetes 部署清单，未包含 Redis 持久化所需的 PV、PVC 等存储资源，也未覆盖 CI/CD 工作流、Jenkins、Istio 等扩展能力。这些部分可以在后续接入实际环境时再按需要补齐和验证。
+
 ## 刷新模式
 
 ### `realtime`
@@ -494,4 +500,3 @@ go test ./...
 - `go run ./cmd/loadtest_cron`
 - `go run ./cmd/loadtest_d`
 - `go run ./cmd/loadtest_e`
-
