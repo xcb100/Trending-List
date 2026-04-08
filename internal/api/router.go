@@ -25,13 +25,13 @@ func NewBusinessMux(readinessTimeout time.Duration, readinessCheck func(context.
 	return mux
 }
 
-func NewInternalMux(readinessTimeout time.Duration, readinessCheck func(context.Context) error) *http.ServeMux {
+func NewInternalMux(readinessTimeout time.Duration, readinessCheck func(context.Context) error, internalToken string) *http.ServeMux {
 	mux := http.NewServeMux()
 	// 内部端口承载健康检查、指标和调度入口，便于后续在集群内单独暴露。
 	mux.HandleFunc("GET /livez", LivenessHandler())
 	mux.HandleFunc("GET /readyz", ReadinessHandler(readinessTimeout, readinessCheck))
 	mux.HandleFunc("GET /healthz", HealthHandler(readinessTimeout, readinessCheck))
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("POST /system/cron/tick", SystemCronTickHandler)
+	mux.HandleFunc("POST /system/cron/tick", RequireInternalToken(internalToken, SystemCronTickHandler))
 	return mux
 }

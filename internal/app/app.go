@@ -3,7 +3,8 @@ package app
 import (
 	"context"
 	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -23,6 +24,8 @@ type App struct {
 	runCtx         context.Context
 	cancel         context.CancelFunc
 	startOnce      sync.Once
+	runErrMu       sync.RWMutex
+	runErr         error
 }
 
 func New(cfg config.Config) *App {
@@ -69,13 +72,38 @@ func New(cfg config.Config) *App {
 		},
 		InternalServer: &http.Server{
 			Addr:              cfg.InternalAddr,
-			Handler:           api.NewInternalMux(cfg.HealthcheckTimeout, readinessCheck),
+			Handler:           api.NewInternalMux(cfg.HealthcheckTimeout, readinessCheck, cfg.InternalAPIToken),
 			ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 			ReadTimeout:       cfg.HTTPReadTimeout,
 			WriteTimeout:      cfg.HTTPWriteTimeout,
 			IdleTimeout:       cfg.HTTPIdleTimeout,
 		},
 	}
+}
+
+func (a *App) Done() <-chan struct{} {
+	return a.runCtx.Done()
+}
+
+func (a *App) RunError() error {
+	a.runErrMu.RLock()
+	defer a.runErrMu.RUnlock()
+	return a.runErr
+}
+
+func (a *App) setRunError(err error) {
+	if err == nil {
+		return
+	}
+
+	a.runErrMu.Lock()
+	defer a.runErrMu.Unlock()
+	if a.runErr != nil {
+		return
+	}
+
+	a.runErr = err
+	a.cancel()
 }
 
 func (a *App) Start(ctx context.Context) {
@@ -90,23 +118,27 @@ func (a *App) Start(ctx context.Context) {
 		}
 
 		go func() {
-			log.Printf("Business API server listening on %s", a.Config.BusinessAddr)
+			slog.Info("business api server listening", "addr", a.Config.BusinessAddr)
 			if err := a.BusinessServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatal("business server error:", err)
+				wrappedErr := fmt.Errorf("business server: %w", err)
+				slog.Error("business api server exited unexpectedly", "error", wrappedErr)
+				a.setRunError(wrappedErr)
 			}
 		}()
 
 		go func() {
-			log.Printf("Internal server listening on %s", a.Config.InternalAddr)
+			slog.Info("internal server listening", "addr", a.Config.InternalAddr)
 			if err := a.InternalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatal("internal server error:", err)
+				wrappedErr := fmt.Errorf("internal server: %w", err)
+				slog.Error("internal server exited unexpectedly", "error", wrappedErr)
+				a.setRunError(wrappedErr)
 			}
 		}()
 
 		if a.Config.SchedulerEnabled {
 			// 调度器使用应用级 context，而不是 Background，
 			// 这样关闭服务时可以及时停止周期性重算循环。
-			go core.StartCronScheduler(a.runCtx)
+			core.StartCronScheduler(a.runCtx)
 		}
 	})
 }
@@ -122,7 +154,7 @@ func (a *App) Shutdown(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	if err := a.RedisClient.Close(); err != nil {
-		log.Printf("close redis client: %v", err)
+		slog.Error("close redis client failed", "error", err)
 		errs = append(errs, err)
 	}
 
