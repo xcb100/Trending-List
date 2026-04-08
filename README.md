@@ -554,3 +554,14 @@ Jenkins Job 可覆盖以下参数：
 - `CONTAINER_NAME`
   默认：`leaderboard`
 
+### Jenkins 安装文件
+
+`jenkins/` 目录提供 Jenkins 在 Linux VM 上运行所需的辅助文件：
+
+- `jenkins/Dockerfile`
+- `jenkins/plugins.txt`
+- `jenkins/docker-compose.yml`
+- `jenkins/k8s-rbac.yaml`
+- `jenkins/generate-kubeconfig.sh`
+- `jenkins/README.md`
+
