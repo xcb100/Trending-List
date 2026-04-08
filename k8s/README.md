@@ -21,10 +21,26 @@
 - `secret.yaml`：敏感配置，例如 Redis 密码
 - `service.yaml`：业务口和内部口 Service
 - `deployment.yaml`：业务 Deployment
-- `redis.yaml`：Redis Deployment 和 Service
+- `redis.yaml`：Redis ConfigMap、Service、StatefulSet 与持久化卷声明
 - `kustomization.yaml`：`kubectl apply -k` 入口
 
-提供的是一套基础可运行的 Kubernetes 部署清单，已覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源，适合用于功能验证和集群内微服务联调。现阶段 Redis 仍按基础依赖处理，未包含 PV、PVC 等持久化配置；如需支持数据保留、备份恢复或更高可用性，可在后续补充相应存储方案。与此同时，面向生产环境的工程化与运维能力，如 CI/CD 流水线、镜像仓库与发布流程、监控告警、日志与链路追踪、服务治理、权限控制及灰度发布等，也尚未纳入当前仓库，后续可结合实际部署要求逐步完善。
+当前清单已覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源，适合用于功能验证和集群内微服务联调。Redis 现已改为单副本 `StatefulSet`，并通过 PVC 持久化 `/data` 目录，便于在 Pod 重建后保留榜单数据。与此同时，面向生产环境的工程化与运维能力，如多副本 Redis 高可用、备份恢复、CI/CD 流水线、镜像仓库与发布流程、监控告警、日志与链路追踪、服务治理、权限控制及灰度发布等，仍可结合实际部署要求继续完善。
+
+## Redis 持久化说明
+
+当前 Redis 部署具备以下特性：
+
+- 使用 `StatefulSet` 管理 Redis Pod 身份与卷绑定关系
+- 使用 `volumeClaimTemplates` 为 `/data` 目录声明持久化存储
+- 通过 `redis.conf` 开启 `AOF` 持久化，并保留 `RDB` 快照策略
+- 同时提供 `redis` 普通 Service 和 `redis-headless` Headless Service
+
+需要注意：
+
+- 当前清单默认**不显式指定** `storageClassName`
+- 如果集群存在默认 `StorageClass`，PVC 会自动绑定
+- 如果集群没有默认 `StorageClass`，则需要先准备存储类，或手动补充 `storageClassName`
+- 当前仍为单副本 Redis，重点在“数据可持久化”，不是 Redis 高可用方案
 
 ## 部署前检查
 
@@ -44,6 +60,23 @@ redis:6379
 ```
 
 这样更适合集群内部服务发现，不依赖固定 IP。
+
+### 2.1 StorageClass
+
+Redis 现在依赖 PVC 持久化数据，因此部署前建议先检查集群是否存在默认 `StorageClass`：
+
+```bash
+kubectl get storageclass
+```
+
+如果输出中某个存储类带有 `(default)`，通常可以直接继续部署。
+
+如果没有默认存储类，则需要：
+
+- 先安装或配置可用的动态存储
+- 或在 `redis.yaml` 的 `volumeClaimTemplates` 中手动补充 `storageClassName`
+
+否则 Redis 对应的 PVC 可能会一直停留在 `Pending` 状态。
 
 ### 3. 集群网络
 
@@ -103,16 +136,23 @@ systemctl show containerd --property=Environment
 
 ```bash
 kubectl apply -k k8s/
-kubectl -n <namespace> get deploy,svc,pod -o wide
-kubectl -n <namespace> rollout status deploy/<redis-deployment-name>
+kubectl -n <namespace> get deploy,statefulset,svc,pod,pvc -o wide
+kubectl -n <namespace> rollout status statefulset/redis
 kubectl -n <namespace> rollout status deploy/<app-deployment-name>
 ```
 
-如果某个 Deployment 一直无法完成 rollout，优先检查：
+如果某个工作负载一直无法完成 rollout，优先检查：
 
 ```bash
 kubectl -n <namespace> describe pod <pod-name>
 kubectl -n <namespace> logs <pod-name>
+```
+
+如果 Redis 长时间无法启动，也建议同时检查 PVC：
+
+```bash
+kubectl -n <namespace> get pvc
+kubectl -n <namespace> describe pvc <pvc-name>
 ```
 
 ## 服务访问方式
@@ -228,7 +268,7 @@ kubectl -n <namespace> get pods -o wide
 
 ```bash
 kubectl -n <namespace> logs deploy/<app-deployment-name> --tail=100
-kubectl -n <namespace> logs deploy/<redis-deployment-name> --tail=100
+kubectl -n <namespace> logs statefulset/redis --tail=100
 ```
 
 查看 Service Endpoints：
@@ -276,6 +316,7 @@ kubectl -n <namespace> logs <pod-name> --tail=100
 - Redis Pod 是否正常运行
 - Redis Service 是否有正确 endpoints
 - 配置里是否使用了正确的 Service 名称或端口
+- Redis 对应 PVC 是否已经成功绑定
 
 常用命令：
 
@@ -283,7 +324,27 @@ kubectl -n <namespace> logs <pod-name> --tail=100
 kubectl -n <namespace> get pods -o wide
 kubectl -n <namespace> get svc
 kubectl -n <namespace> get endpoints <redis-service-name> -o wide
+kubectl -n <namespace> get pvc
 ```
+
+## 数据恢复验证
+
+完成部署并写入一些排行榜数据后，可以做一次最基本的持久化验证：
+
+1. 记录当前 Redis Pod 名称
+2. 删除该 Pod，等待 `StatefulSet` 自动重建
+3. 再次查询排行榜数据，确认内容仍然存在
+
+示例：
+
+```bash
+kubectl -n <namespace> get pods -l app=redis
+kubectl -n <namespace> delete pod redis-0
+kubectl -n <namespace> rollout status statefulset/redis
+kubectl -n <namespace> get pvc
+```
+
+如果 PVC 保持 `Bound`，且业务数据在 Pod 重建后仍可查询，说明当前 Redis 持久化链路已经生效。
 
 ### 4. 多节点下网络异常
 

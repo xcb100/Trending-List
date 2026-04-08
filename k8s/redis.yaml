@@ -1,46 +1,44 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: redis
+  name: redis-config
+  namespace: leaderboard
+data:
+  redis.conf: |
+    bind 0.0.0.0
+    protected-mode no
+    port 6379
+    timeout 0
+    tcp-keepalive 300
+
+    dir /data
+    dbfilename dump.rdb
+
+    appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+
+    save 900 1
+    save 300 10
+    save 60 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
   namespace: leaderboard
   labels:
     app: redis
 spec:
-  replicas: 1
+  clusterIP: None
   selector:
-    matchLabels:
-      app: redis
-  template:
-    metadata:
-      labels:
-        app: redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: redis
-              containerPort: 6379
-          resources:
-            requests:
-              cpu: "50m"
-              memory: "64Mi"
-            limits:
-              cpu: "250m"
-              memory: "256Mi"
-          livenessProbe:
-            tcpSocket:
-              port: redis
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 2
-          readinessProbe:
-            tcpSocket:
-              port: redis
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 2
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
 ---
 apiVersion: v1
 kind: Service
@@ -58,3 +56,115 @@ spec:
       port: 6379
       targetPort: redis
       protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: leaderboard
+  labels:
+    app: redis
+spec:
+  serviceName: redis-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              if [ -n "$REDIS_PASSWORD" ]; then
+                exec redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"
+              fi
+              exec redis-server /etc/redis/redis.conf
+          ports:
+            - name: redis
+              containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: leaderboard-secret
+                  key: REDIS_PASSWORD
+                  optional: true
+          volumeMounts:
+            - name: redis-config
+              mountPath: /etc/redis/redis.conf
+              subPath: redis.conf
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "512Mi"
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  if [ -n "$REDIS_PASSWORD" ]; then
+                    redis-cli -a "$REDIS_PASSWORD" ping
+                  else
+                    redis-cli ping
+                  fi
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  if [ -n "$REDIS_PASSWORD" ]; then
+                    redis-cli -a "$REDIS_PASSWORD" ping
+                  else
+                    redis-cli ping
+                  fi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  if [ -n "$REDIS_PASSWORD" ]; then
+                    redis-cli -a "$REDIS_PASSWORD" ping
+                  else
+                    redis-cli ping
+                  fi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 2Gi
