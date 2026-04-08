@@ -503,3 +503,54 @@ go test ./...
 - `go run ./cmd/loadtest_d`
 - `go run ./cmd/loadtest_e`
 
+## Jenkins CI/CD
+
+仓库根目录提供 `Jenkinsfile`。
+
+流水线阶段：
+
+- `Checkout`
+- `Test`：拉起临时 `redis:7-alpine` 容器，执行 `go test ./... -cover`
+- `Build Image`：构建业务镜像
+- `Push Image`：仅在 `main/master` 分支推送镜像
+- `Deploy`：仅在 `main/master` 分支执行 `kubectl set image` 和滚动发布检查
+
+### Jenkins 节点前置条件
+
+运行该流水线的 Jenkins 节点需要满足：
+
+- 节点标签包含 `docker-kubectl`
+- 已安装可用的 `docker` CLI，并且 Jenkins 运行用户可以执行 Docker 命令
+- 已安装可用的 `kubectl`
+- `kubectl` 当前上下文能够访问目标 Kubernetes 集群
+
+Jenkins 节点应能够直接执行：
+
+```bash
+docker ps
+kubectl -n leaderboard get pods
+```
+
+### Jenkins 凭据
+
+`Jenkinsfile` 默认使用以下凭据：
+
+- `dockerhub-creds`
+  类型：`Username with password`
+  用途：登录 Docker Hub 并推送镜像
+
+### Jenkins 参数
+
+Jenkins Job 可覆盖以下参数：
+
+- `IMAGE_REPO`
+  默认：`jn6057/leaderboard-service`
+- `IMAGE_TAG`
+  默认：空，实际会回退到 `BUILD_NUMBER`
+- `DEPLOY_NAMESPACE`
+  默认：`leaderboard`
+- `DEPLOYMENT_NAME`
+  默认：`leaderboard`
+- `CONTAINER_NAME`
+  默认：`leaderboard`
+

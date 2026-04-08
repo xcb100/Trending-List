@@ -163,6 +163,7 @@ spec:
     - metadata:
         name: redis-data
       spec:
+        storageClassName: local-path
         accessModes:
           - ReadWriteOnce
         resources:

@@ -4,7 +4,7 @@
 
 本目录包含排行榜服务及其 Redis 依赖的 Kubernetes 部署清单。
 
-建议先根据自己的环境确认以下内容：
+部署前检查以下内容：
 
 - 命名空间名称
 - 业务镜像地址和标签
@@ -24,59 +24,47 @@
 - `redis.yaml`：Redis ConfigMap、Service、StatefulSet 与持久化卷声明
 - `kustomization.yaml`：`kubectl apply -k` 入口
 
-当前清单已覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源，适合用于功能验证和集群内微服务联调。Redis 现已改为单副本 `StatefulSet`，并通过 PVC 持久化 `/data` 目录，便于在 Pod 重建后保留榜单数据。与此同时，面向生产环境的工程化与运维能力，如多副本 Redis 高可用、备份恢复、CI/CD 流水线、镜像仓库与发布流程、监控告警、日志与链路追踪、服务治理、权限控制及灰度发布等，仍可结合实际部署要求继续完善。
+当前清单覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源。Redis 使用单副本 `StatefulSet` 和 PVC 持久化 `/data` 目录。
 
 ## Redis 持久化说明
 
-当前 Redis 部署具备以下特性：
+Redis 部署特性：
 
 - 使用 `StatefulSet` 管理 Redis Pod 身份与卷绑定关系
 - 使用 `volumeClaimTemplates` 为 `/data` 目录声明持久化存储
 - 通过 `redis.conf` 开启 `AOF` 持久化，并保留 `RDB` 快照策略
 - 同时提供 `redis` 普通 Service 和 `redis-headless` Headless Service
 
-需要注意：
+存储说明：
 
-- 当前清单默认**不显式指定** `storageClassName`
-- 如果集群存在默认 `StorageClass`，PVC 会自动绑定
-- 如果集群没有默认 `StorageClass`，则需要先准备存储类，或手动补充 `storageClassName`
-- 当前仍为单副本 Redis，重点在“数据可持久化”，不是 Redis 高可用方案
+- 清单默认使用 `local-path` 作为 `storageClassName`
+- 使用其他存储类时，需要把 `redis.yaml` 中的 `storageClassName` 改成对应名称
+- 当前 Redis 为单副本持久化部署
 
 ## 部署前检查
 
 ### 1. 镜像地址
 
-先确认 `deployment.yaml` 中的业务镜像地址是当前可访问、可拉取的镜像。
-
-此处用的是docker构建打包到docker hub。
+确认 `deployment.yaml` 中的业务镜像地址可访问且可拉取。
 
 
 ### 2. Redis 地址
 
-在 `configmap.yaml` 中，`REDIS_ADDR` 建议优先写成 Kubernetes Service 名称，例如：
+`configmap.yaml` 中的 `REDIS_ADDR` 使用 Kubernetes Service 名称：
 
 ```text
 redis:6379
 ```
 
-这样更适合集群内部服务发现，不依赖固定 IP。
-
 ### 2.1 StorageClass
 
-Redis 现在依赖 PVC 持久化数据，因此部署前建议先检查集群是否存在默认 `StorageClass`：
+Redis 依赖 PVC 持久化数据。部署前检查集群中是否存在 `local-path`，或将 `redis.yaml` 中的 `storageClassName` 改成目标存储类名称：
 
 ```bash
 kubectl get storageclass
 ```
 
-如果输出中某个存储类带有 `(default)`，通常可以直接继续部署。
-
-如果没有默认存储类，则需要：
-
-- 先安装或配置可用的动态存储
-- 或在 `redis.yaml` 的 `volumeClaimTemplates` 中手动补充 `storageClassName`
-
-否则 Redis 对应的 PVC 可能会一直停留在 `Pending` 状态。
+没有可用存储类时，Redis 对应的 PVC 会停留在 `Pending` 状态。
 
 ### 3. 集群网络
 
@@ -159,7 +147,7 @@ kubectl -n <namespace> describe pvc <pvc-name>
 
 ### 集群内访问
 
-微服务之间调用时，建议统一使用 Kubernetes Service 名称，而不是节点 IP。
+微服务之间调用统一使用 Kubernetes Service 名称。
 
 典型方式：
 
@@ -181,7 +169,7 @@ kubectl -n <namespace> describe pvc <pvc-name>
 - `LoadBalancer`
 - `Ingress`
 
-如果只是虚拟机环境下快速验证，`NodePort` 往往最直接。
+虚拟机环境下可使用 `NodePort` 进行集群外访问。
 
 ## 功能验证
 
@@ -232,11 +220,9 @@ curl -sS -X POST http://<access-address>/leaderboard/top_videos/item \
 curl -sS "http://<access-address>/leaderboard/top_videos?n=10"
 ```
 
-如果返回内容正常，说明业务链路已经打通。
-
 ## 内部接口验证
 
-如果内部接口没有直接暴露到集群外，可以使用端口转发：
+内部接口未直接暴露到集群外时，可使用端口转发：
 
 ```bash
 kubectl -n <namespace> port-forward svc/<internal-service-name> 9090:9090
@@ -329,7 +315,7 @@ kubectl -n <namespace> get pvc
 
 ## 数据恢复验证
 
-完成部署并写入一些排行榜数据后，可以做一次最基本的持久化验证：
+完成部署并写入排行榜数据后，可执行以下持久化验证：
 
 1. 记录当前 Redis Pod 名称
 2. 删除该 Pod，等待 `StatefulSet` 自动重建
@@ -344,7 +330,7 @@ kubectl -n <namespace> rollout status statefulset/redis
 kubectl -n <namespace> get pvc
 ```
 
-如果 PVC 保持 `Bound`，且业务数据在 Pod 重建后仍可查询，说明当前 Redis 持久化链路已经生效。
+PVC 保持 `Bound`，且业务数据在 Pod 重建后仍可查询时，说明 Redis 持久化链路生效。
 
 ### 4. 多节点下网络异常
 
