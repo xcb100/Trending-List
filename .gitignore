@@ -11,3 +11,9 @@ vendor/
 awesomeProject.exe
 .gocache/
 .gotmp/
+AGENT.md
+**/AGENT.md
+context.md
+CONTEXT.md
+**/context.md
+**/CONTEXT.md
