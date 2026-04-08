@@ -481,7 +481,7 @@ go test ./...
 
 ### 综合 Redis 终极测试
 
-[internal/core/ultimate_redis_test.go](/c:/Users/Administrator/GolandProjects/awesomeProject/internal/core/ultimate_redis_test.go) 使用真实 Redis 做一条较完整的集成链路验证，覆盖：
+`internal/core/ultimate_redis_test.go` 使用真实 Redis 做一条较完整的集成链路验证，覆盖：
 
 - 实时榜
 - 定时榜

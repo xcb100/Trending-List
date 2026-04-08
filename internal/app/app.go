@@ -8,9 +8,9 @@ import (
 	"net/http"
 	"sync"
 
-	"awesomeProject/internal/api"
-	"awesomeProject/internal/config"
-	"awesomeProject/internal/core"
+	"trendingList/internal/api"
+	"trendingList/internal/config"
+	"trendingList/internal/core"
 
 	"github.com/redis/go-redis/v9"
 )

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"awesomeProject/internal/core"
+	"trendingList/internal/core"
 )
 
 func CreateLeaderboardHandler(w http.ResponseWriter, r *http.Request) {

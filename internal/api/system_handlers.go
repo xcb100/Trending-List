@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"time"
 
-	"awesomeProject/internal/core"
+	"trendingList/internal/core"
 )
 
 func SystemCronTickHandler(w http.ResponseWriter, r *http.Request) {

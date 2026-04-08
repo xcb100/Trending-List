@@ -1,4 +1,4 @@
-module awesomeProject
+module trendingList
 
 go 1.25.0
 

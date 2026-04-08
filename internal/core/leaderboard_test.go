@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"awesomeProject/internal/core"
+	"trendingList/internal/core"
 )
 
 // mockRepo 是一个内存版仓储，用于核心逻辑单元测试。

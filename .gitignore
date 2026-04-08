@@ -8,7 +8,7 @@ vendor/
 .env
 .idea/
 .vscode/
-awesomeProject.exe
+trendingList.exe
 .gocache/
 .gotmp/
 AGENT.md

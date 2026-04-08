@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"awesomeProject/internal/app"
-	"awesomeProject/internal/config"
+	"trendingList/internal/app"
+	"trendingList/internal/config"
 )
 
 func main() {

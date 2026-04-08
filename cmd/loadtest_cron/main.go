@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"awesomeProject/internal/core"
+	"trendingList/internal/core"
 
 	"github.com/redis/go-redis/v9"
 )
