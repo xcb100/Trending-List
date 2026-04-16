@@ -17,11 +17,6 @@ type ScheduleUpdateRequest struct {
 	CronSpec string `json:"cron_spec"`
 }
 
-type UpdateExpressionRequest struct {
-	Expression string                 `json:"expression"`
-	Schema     map[string]interface{} `json:"schema"`
-}
-
 type ErrorResponse struct {
 	Error string `json:"error"`
 }

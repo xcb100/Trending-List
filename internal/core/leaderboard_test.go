@@ -130,17 +130,6 @@ func (m *mockRepo) MarkItemDirty(ctx context.Context, lbID string, itemID string
 	return nil
 }
 
-func (m *mockRepo) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.dirty[lbID] != nil {
-		for _, id := range itemIDs {
-			delete(m.dirty[lbID], id)
-		}
-	}
-	return nil
-}
-
 func (m *mockRepo) PruneItems(ctx context.Context, lbID string, itemIDs []string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -233,17 +222,6 @@ func (m *mockRepo) GetItems(ctx context.Context, lbID string, itemIDs []string) 
 	return res, nil
 }
 
-func (m *mockRepo) UpdateItemsScores(ctx context.Context, lbID string, scores map[string]float64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for id, sc := range scores {
-		if m.items[lbID] != nil && m.items[lbID][id] != nil {
-			m.items[lbID][id].Score = sc
-		}
-	}
-	return nil
-}
-
 func (m *mockRepo) GetTopN(ctx context.Context, lbID string, n int) ([]*core.Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -261,17 +239,6 @@ func (m *mockRepo) GetTopN(ctx context.Context, lbID string, n int) ([]*core.Ite
 		return all[:n], nil
 	}
 	return all, nil
-}
-
-func (m *mockRepo) IterateItems(ctx context.Context, lbID string, callback func(item *core.Item) bool) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, item := range m.items[lbID] {
-		if !callback(item) {
-			break
-		}
-	}
-	return nil
 }
 
 func (m *mockRepo) GetItem(ctx context.Context, lbID string, itemID string) (*core.Item, error) {

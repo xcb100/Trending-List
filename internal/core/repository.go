@@ -18,7 +18,6 @@ type Repository interface {
 	MarkItemDirty(ctx context.Context, lbID string, itemID string, dirty bool) error
 	ScanDirtyItemIDs(ctx context.Context, lbID string, cursor uint64, count int64) ([]string, uint64, error)
 	CommitRecomputedScores(ctx context.Context, lbID string, scores map[string]float64, updatedAts map[string]time.Time) error
-	ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error
 	PruneItems(ctx context.Context, lbID string, itemIDs []string) error
 
 	AcquireLock(ctx context.Context, key string, ttl time.Duration) (bool, error)
@@ -31,9 +30,7 @@ type Repository interface {
 
 	GetDirtyItemIDs(ctx context.Context, lbID string) ([]string, error)
 	GetItems(ctx context.Context, lbID string, itemIDs []string) ([]*Item, error)
-	UpdateItemsScores(ctx context.Context, lbID string, scores map[string]float64) error
 
 	GetTopN(ctx context.Context, lbID string, n int) ([]*Item, error)
-	IterateItems(ctx context.Context, lbID string, callback func(item *Item) bool) error
 	GetItem(ctx context.Context, lbID string, itemID string) (*Item, error)
 }

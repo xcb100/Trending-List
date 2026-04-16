@@ -201,54 +201,6 @@ func RecomputeLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func UpdateExpressionHandler(w http.ResponseWriter, r *http.Request) {
-	lbID := r.PathValue("id")
-	if lbID == "" {
-		sendError(w, http.StatusBadRequest, "leaderboard id is required")
-		return
-	}
-
-	lb, err := core.GetLeaderboard(r.Context(), lbID)
-	if err != nil {
-		if errors.Is(err, core.ErrLeaderboardNotFound) {
-			sendError(w, http.StatusNotFound, "leaderboard not found")
-			return
-		}
-		sendError(w, http.StatusInternalServerError, "failed to load leaderboard")
-		return
-	}
-
-	var req UpdateExpressionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		sendError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if req.Expression == "" {
-		sendError(w, http.StatusBadRequest, "expression is required")
-		return
-	}
-
-	if err := core.UpdateLeaderboardExpression(r.Context(), lb, req.Expression, req.Schema); err != nil {
-		// 表达式更新会触发全量重算，因此也可能因为已有重算任务而冲突。
-		if errors.Is(err, core.ErrRecomputeInProgress) {
-			sendError(w, http.StatusConflict, err.Error())
-			return
-		}
-		sendError(w, http.StatusBadRequest, "failed to update expression: "+err.Error())
-		return
-	}
-
-	state := lb.State()
-	sendJSON(w, http.StatusOK, map[string]interface{}{
-		"status":          "expression_updated",
-		"id":              state.ID,
-		"expression":      state.Expression,
-		"refresh_policy":  state.RefreshPolicy,
-		"last_recomputed": state.LastRecomputedAt,
-		"schema_provided": req.Schema != nil,
-	})
-}
-
 func DeleteItemHandler(w http.ResponseWriter, r *http.Request) {
 	lbID := r.PathValue("id")
 	itemID := r.PathValue("item_id")

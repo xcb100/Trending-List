@@ -20,7 +20,6 @@ func NewBusinessMux(readinessTimeout time.Duration, readinessCheck func(context.
 	mux.HandleFunc("GET /leaderboard/{id}", MetricsMiddleware("/leaderboard/{id}", GetLeaderboardHandler))
 	mux.HandleFunc("DELETE /leaderboard/{id}", MetricsMiddleware("/leaderboard/{id}", DeleteLeaderboardHandler))
 	mux.HandleFunc("POST /leaderboard/{id}/schedule", MetricsMiddleware("/leaderboard/{id}/schedule", ScheduleUpdateHandler))
-	mux.HandleFunc("POST /leaderboard/{id}/expression", MetricsMiddleware("/leaderboard/{id}/expression", UpdateExpressionHandler))
 	mux.HandleFunc("POST /leaderboard/{id}/recompute", MetricsMiddleware("/leaderboard/{id}/recompute", RecomputeLeaderboardHandler))
 	return mux
 }

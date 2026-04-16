@@ -276,21 +276,6 @@ func (r *RedisRepository) CommitRecomputedScores(ctx context.Context, lbID strin
 	return r.client.Eval(ctx, commitRecomputeScript, []string{r.itemsKey(lbID), r.scoresKey(lbID), r.dirtyKey(lbID)}, args...).Err()
 }
 
-func (r *RedisRepository) ClearDirtyItemIDs(ctx context.Context, lbID string, itemIDs []string) error {
-	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
-	defer cancel()
-
-	if len(itemIDs) == 0 {
-		return nil
-	}
-
-	args := make([]interface{}, len(itemIDs))
-	for i, id := range itemIDs {
-		args[i] = id
-	}
-	return r.client.SRem(ctx, r.dirtyKey(lbID), args...).Err()
-}
-
 func (r *RedisRepository) PruneItems(ctx context.Context, lbID string, itemIDs []string) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
@@ -387,21 +372,6 @@ func (r *RedisRepository) GetItems(ctx context.Context, lbID string, itemIDs []s
 	return result, nil
 }
 
-func (r *RedisRepository) UpdateItemsScores(ctx context.Context, lbID string, scores map[string]float64) error {
-	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
-	defer cancel()
-
-	if len(scores) == 0 {
-		return nil
-	}
-
-	zArgs := make([]redis.Z, 0, len(scores))
-	for id, score := range scores {
-		zArgs = append(zArgs, redis.Z{Score: score, Member: id})
-	}
-	return r.client.ZAdd(ctx, r.scoresKey(lbID), zArgs...).Err()
-}
-
 func (r *RedisRepository) GetTopN(ctx context.Context, lbID string, n int) ([]*Item, error) {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
@@ -453,35 +423,4 @@ func (r *RedisRepository) GetTopN(ctx context.Context, lbID string, n int) ([]*I
 	}
 
 	return items, nil
-}
-
-func (r *RedisRepository) IterateItems(ctx context.Context, lbID string, callback func(item *Item) bool) error {
-	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
-	defer cancel()
-
-	iter := r.client.HScan(ctx, r.itemsKey(lbID), 0, "", 0).Iterator()
-	// HSCAN 用于全量重算场景，避免一次性把整张 items hash 全部读入内存。
-	for iter.Next(ctx) {
-		itemID := iter.Val()
-		if !iter.Next(ctx) {
-			break
-		}
-		itemDataJSON := iter.Val()
-
-		var payload DataPayload
-		if err := json.Unmarshal([]byte(itemDataJSON), &payload); err != nil {
-			continue
-		}
-
-		if !callback(&Item{
-			ID:        itemID,
-			Data:      payload.Data,
-			Score:     0,
-			UpdatedAt: payload.UpdatedAt,
-		}) {
-			break
-		}
-	}
-
-	return iter.Err()
 }

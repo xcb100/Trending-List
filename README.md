@@ -8,8 +8,7 @@
 - 写入或更新条目
 - 查询 Top N
 - 手动触发重算
-- 在线更新定时表达式
-- 在线更新评分表达式
+- 在线更新定时策略
 - 删除排行榜
 - 删除单个条目
 - 健康检查接口
@@ -186,7 +185,6 @@ go run .
 - 写入条目
 - 查询排行榜
 - 更新定时策略
-- 更新评分表达式
 - 手动重算
 - 删除条目
 - 删除排行榜
@@ -298,31 +296,7 @@ go run .
 - 会把排行榜切换为 `scheduled`
 - 会重新注册调度分层
 
-### 6. 在线更新评分表达式
-
-`POST /leaderboard/{id}/expression`
-
-请求示例：
-
-```json
-{
-  "expression": "views * 0.3 + likes * 4 + shares * 10",
-  "schema": {
-    "views": 0,
-    "likes": 0,
-    "shares": 0
-  }
-}
-```
-
-说明：
-
-- `expression` 必填
-- `schema` 可选
-- 如果提供 `schema`，会替换原有 schema
-- 更新成功后会执行一次全量重算
-
-### 7. 删除条目
+### 6. 删除条目
 
 `DELETE /leaderboard/{id}/item/{item_id}`
 
@@ -332,7 +306,7 @@ go run .
 - 删除对应分数
 - 删除 dirty 标记
 
-### 8. 删除排行榜
+### 7. 删除排行榜
 
 `DELETE /leaderboard/{id}`
 
@@ -342,7 +316,7 @@ go run .
 - 清理调度分层索引
 - 清理当前进程内缓存对象
 
-### 9. 手动触发全部调度层
+### 8. 手动触发全部调度层
 
 `POST /system/cron/tick`
 
@@ -361,7 +335,7 @@ go run .
 当前处理方式：
 
 - 创建排行榜时编译表达式
-- 更新表达式时重新编译
+- 排行榜创建后评分表达式不可变，如需调整建议创建新榜单版本并迁移读取入口
 - 运行时环境基于 `schema` 和条目数据生成
 - 支持 `updated_at` 和 `now`
 
@@ -400,7 +374,7 @@ go run .
 - 健康检查接口
 - Prometheus `/metrics`
 - HTTP 请求总量与延迟指标
-- 排行榜创建、恢复、写入、重算、表达式更新、删除、调度 tick 等核心指标
+- 排行榜创建、恢复、写入、重算、删除、调度 tick 等核心指标
 - JSON 结构化日志
 
 ### 当前指标示例
@@ -412,8 +386,6 @@ go run .
 - `leaderboard_upsert_total`
 - `leaderboard_recompute_total`
 - `leaderboard_recompute_duration_seconds`
-- `leaderboard_expression_update_total`
-- `leaderboard_expression_update_duration_seconds`
 - `leaderboard_scheduler_tick_total`
 - `leaderboards_loaded`
 
@@ -487,7 +459,6 @@ go test ./...
 - 定时榜
 - 非法 `cron_spec`
 - 重复创建冲突
-- 在线更新表达式
 - 条目删除
 - 排行榜删除
 - 大批量数据写入与重算

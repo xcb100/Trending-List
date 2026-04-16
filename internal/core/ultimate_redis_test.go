@@ -107,20 +107,6 @@ func TestUltimateRedisFlow(t *testing.T) {
 	}
 	assertTopNMatches(t, topRealtime, topNExpected(rankedItemsFromMap(realtimeExpected), 10))
 
-	if err := core.UpdateLeaderboardExpression(ctx, realtimeLB, "views*3 + likes*2 + bonus", nil); err != nil {
-		t.Fatalf("update realtime expression: %v", err)
-	}
-	for id, score := range realtimeExpected {
-		index := parseIndex(id)
-		realtimeExpected[id] = float64(index*3)*3 + float64((index*7)%17)*2 + float64(index%5)
-		_ = score
-	}
-	topRealtime, err = realtimeLB.GetTopN(ctx, 10)
-	if err != nil {
-		t.Fatalf("read realtime topN after expression update: %v", err)
-	}
-	assertTopNMatches(t, topRealtime, topNExpected(rankedItemsFromMap(realtimeExpected), 10))
-
 	scheduledLB, err := core.CreateLeaderboard(
 		ctx,
 		scheduledID,
@@ -368,12 +354,6 @@ func rankedItemsFromMap(scores map[string]float64) []rankedItem {
 		items = append(items, rankedItem{ID: id, Score: score})
 	}
 	return items
-}
-
-func parseIndex(id string) int {
-	var index int
-	_, _ = fmt.Sscanf(id[len(id)-4:], "%d", &index)
-	return index
 }
 
 func assertTopNMatches(t *testing.T, actual []*core.Item, expected []rankedItem) {

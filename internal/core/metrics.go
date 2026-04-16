@@ -60,23 +60,6 @@ var (
 		[]string{"trigger", "status"},
 	)
 
-	leaderboardExpressionUpdateTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "leaderboard_expression_update_total",
-			Help: "Total number of leaderboard expression update attempts.",
-		},
-		[]string{"status"},
-	)
-
-	leaderboardExpressionUpdateDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "leaderboard_expression_update_duration_seconds",
-			Help:    "Duration of leaderboard expression update attempts.",
-			Buckets: []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
-		},
-		[]string{"status"},
-	)
-
 	leaderboardDeleteTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "leaderboard_delete_total",
@@ -111,8 +94,6 @@ func init() {
 		leaderboardUpsertTotal,
 		leaderboardRecomputeTotal,
 		leaderboardRecomputeDuration,
-		leaderboardExpressionUpdateTotal,
-		leaderboardExpressionUpdateDuration,
 		leaderboardDeleteTotal,
 		itemDeleteTotal,
 		schedulerTickTotal,
@@ -135,11 +116,6 @@ func recordRecompute(trigger, status string, duration time.Duration) {
 	// 重算同时记录次数和耗时，便于区分“失败变多”与“变慢但仍成功”两类问题。
 	leaderboardRecomputeTotal.WithLabelValues(trigger, status).Inc()
 	leaderboardRecomputeDuration.WithLabelValues(trigger, status).Observe(duration.Seconds())
-}
-
-func recordExpressionUpdate(status string, duration time.Duration) {
-	leaderboardExpressionUpdateTotal.WithLabelValues(status).Inc()
-	leaderboardExpressionUpdateDuration.WithLabelValues(status).Observe(duration.Seconds())
 }
 
 func recordDeleteLeaderboard(status string) {
