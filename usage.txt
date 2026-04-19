@@ -20,3 +20,15 @@ curl.exe -X POST "http://localhost:8080/leaderboard/hot_articles/recompute"
 查看榜单前 10 名：
 
 curl.exe "http://localhost:8080/leaderboard/top_videos?n=10"
+
+从 MySQL 快照重建全部 Redis 数据：
+
+curl.exe -X POST "http://localhost:9090/system/durable/replay" -H "X-Internal-Token: your-token" -H "Content-Type: application/json" -d "{}"
+
+从 MySQL 快照重建单个榜单：
+
+curl.exe -X POST "http://localhost:9090/system/durable/replay" -H "X-Internal-Token: your-token" -H "Content-Type: application/json" -d "{\"leaderboard_id\":\"top_videos\"}"
+
+本地一键联调环境：
+
+docker compose up --build

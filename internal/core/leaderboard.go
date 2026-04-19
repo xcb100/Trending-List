@@ -327,6 +327,11 @@ func CreateLeaderboard(ctx context.Context, id, expression string, schema map[st
 		repo:          repo,
 	}
 
+	if err := appendLeaderboardUpsertEvent(ctx, lb.snapshot()); err != nil {
+		recordCreate("error")
+		return nil, fmt.Errorf("append durable create event: %w", err)
+	}
+
 	if err := repo.SaveMetadata(ctx, id, metadataFromLeaderboard(lb)); err != nil {
 		recordCreate("error")
 		return nil, fmt.Errorf("failed to save leaderboard metadata: %w", err)
@@ -489,6 +494,10 @@ func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[strin
 	snapshot := lb.snapshot()
 	ts := time.Now()
 	if snapshot.RefreshPolicy == RefreshPolicyScheduled {
+		if err := appendItemUpsertEvent(ctx, snapshot.ID, id, data, ts, nil); err != nil {
+			recordUpsert(snapshot.RefreshPolicy, "error")
+			return nil, fmt.Errorf("append durable item event: %w", err)
+		}
 		if err := lb.repo.SaveItemData(ctx, snapshot.ID, id, data, ts); err != nil {
 			recordUpsert(snapshot.RefreshPolicy, "error")
 			return nil, fmt.Errorf("failed to save item data: %w", err)
@@ -510,6 +519,10 @@ func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[strin
 	if err != nil {
 		recordUpsert(snapshot.RefreshPolicy, "error")
 		return nil, err
+	}
+	if err := appendItemUpsertEvent(ctx, snapshot.ID, id, data, ts, &score); err != nil {
+		recordUpsert(snapshot.RefreshPolicy, "error")
+		return nil, fmt.Errorf("append durable item event: %w", err)
 	}
 	if err := lb.repo.UpsertItem(ctx, snapshot.ID, id, score, data, ts); err != nil {
 		recordUpsert(snapshot.RefreshPolicy, "error")
@@ -656,6 +669,11 @@ func UpdateLeaderboardSchedule(ctx context.Context, lb *Leaderboard, cronSpec st
 	previous := lb.replaceSchedule(RefreshPolicyScheduled, cronSpec)
 	current := lb.snapshot()
 
+	if err := appendLeaderboardUpsertEvent(ctx, current); err != nil {
+		lb.restoreFromSnapshot(previous)
+		return fmt.Errorf("append durable schedule event: %w", err)
+	}
+
 	if err := lb.repo.SaveMetadata(ctx, current.ID, metadataFromSnapshot(current)); err != nil {
 		lb.restoreFromSnapshot(previous)
 		return fmt.Errorf("failed to save schedule metadata: %w", err)
@@ -681,6 +699,10 @@ func DeleteLeaderboard(ctx context.Context, id string) error {
 		recordDeleteLeaderboard("error")
 		return err
 	}
+	if err := appendLeaderboardDeleteEvent(ctx, id); err != nil {
+		recordDeleteLeaderboard("error")
+		return fmt.Errorf("append durable delete leaderboard event: %w", err)
+	}
 	if err := lb.repo.DeleteLeaderboard(ctx, id); err != nil {
 		recordDeleteLeaderboard("error")
 		return fmt.Errorf("delete leaderboard: %w", err)
@@ -695,6 +717,10 @@ func DeleteLeaderboard(ctx context.Context, id string) error {
 
 func (lb *Leaderboard) DeleteItem(ctx context.Context, itemID string) error {
 	snapshot := lb.snapshot()
+	if err := appendItemDeleteEvent(ctx, snapshot.ID, itemID); err != nil {
+		recordDeleteItem("error")
+		return fmt.Errorf("append durable delete item event: %w", err)
+	}
 	if err := lb.repo.DeleteItem(ctx, snapshot.ID, itemID); err != nil {
 		recordDeleteItem("error")
 		return fmt.Errorf("delete item: %w", err)

@@ -22,7 +22,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	application := app.New(cfg)
+	application, err := app.New(cfg)
+	if err != nil {
+		slog.Error("build application failed", "error", err)
+		os.Exit(1)
+	}
 	// 用信号驱动主 context，统一控制 HTTP 服务和后台调度器退出。
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

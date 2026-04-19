@@ -28,6 +28,15 @@ func TestLoadParsesTypedConfig(t *testing.T) {
 	t.Setenv("SCHEDULED_TASK_TIMEOUT", "8s")
 	t.Setenv("SCHEDULED_TASK_LOCK_TTL", "12s")
 	t.Setenv("LEADERBOARD_CREATE_LOCK_TTL", "6s")
+	t.Setenv("MYSQL_DSN", "user:pass@tcp(mysql:3306)/trending?parseTime=true")
+	t.Setenv("MYSQL_MAX_OPEN_CONNS", "30")
+	t.Setenv("MYSQL_MAX_IDLE_CONNS", "8")
+	t.Setenv("MYSQL_CONN_MAX_LIFETIME", "45m")
+	t.Setenv("MYSQL_EVENT_MERGE_INTERVAL", "2s")
+	t.Setenv("MYSQL_EVENT_MERGE_BATCH_SIZE", "700")
+	t.Setenv("MYSQL_EVENT_CLEANUP_INTERVAL", "2m")
+	t.Setenv("MYSQL_EVENT_CLEANUP_RETENTION", "48h")
+	t.Setenv("MYSQL_EVENT_CLEANUP_BATCH_SIZE", "1500")
 
 	cfg, err := Load()
 	if err != nil {
@@ -58,9 +67,30 @@ func TestLoadParsesTypedConfig(t *testing.T) {
 	if cfg.ScheduledTaskLockTTL != 12*time.Second {
 		t.Fatalf("expected task lock ttl 12s, got %s", cfg.ScheduledTaskLockTTL)
 	}
+	if cfg.MySQLDSN == "" {
+		t.Fatal("expected mysql dsn to be loaded")
+	}
+	if cfg.MySQLMaxOpenConns != 30 || cfg.MySQLMaxIdleConns != 8 {
+		t.Fatalf("expected mysql pool sizing to be parsed, got open=%d idle=%d", cfg.MySQLMaxOpenConns, cfg.MySQLMaxIdleConns)
+	}
+	if cfg.MySQLConnMaxLifetime != 45*time.Minute {
+		t.Fatalf("expected mysql conn max lifetime 45m, got %s", cfg.MySQLConnMaxLifetime)
+	}
+	if cfg.MySQLEventMergeInterval != 2*time.Second || cfg.MySQLEventMergeBatchSize != 700 {
+		t.Fatalf("expected mysql merge settings to be parsed, got interval=%s batch=%d", cfg.MySQLEventMergeInterval, cfg.MySQLEventMergeBatchSize)
+	}
+	if cfg.MySQLEventCleanupInterval != 2*time.Minute || cfg.MySQLEventCleanupRetention != 48*time.Hour || cfg.MySQLEventCleanupBatchSize != 1500 {
+		t.Fatalf(
+			"expected mysql cleanup settings to be parsed, got interval=%s retention=%s batch=%d",
+			cfg.MySQLEventCleanupInterval,
+			cfg.MySQLEventCleanupRetention,
+			cfg.MySQLEventCleanupBatchSize,
+		)
+	}
 }
 
 func TestLoadRejectsInvalidTypedConfig(t *testing.T) {
+	t.Setenv("MYSQL_DSN", "user:pass@tcp(mysql:3306)/trending?parseTime=true")
 	t.Setenv("HTTP_READ_TIMEOUT", "definitely-not-a-duration")
 
 	_, err := Load()
@@ -69,5 +99,15 @@ func TestLoadRejectsInvalidTypedConfig(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "HTTP_READ_TIMEOUT") {
 		t.Fatalf("expected error to reference invalid key, got %v", err)
+	}
+}
+
+func TestLoadRequiresMySQLDSN(t *testing.T) {
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected Load() to reject empty MYSQL_DSN")
+	}
+	if !strings.Contains(err.Error(), "MYSQL_DSN") {
+		t.Fatalf("expected error to mention MYSQL_DSN, got %v", err)
 	}
 }

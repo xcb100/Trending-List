@@ -2,15 +2,18 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
 	"trendingList/internal/api"
 	"trendingList/internal/config"
 	"trendingList/internal/core"
+	"trendingList/internal/persistence"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -18,7 +21,9 @@ import (
 type App struct {
 	Config         config.Config
 	RedisClient    *redis.Client
+	MySQLDB        *sql.DB
 	Repository     *core.RedisRepository
+	DurableStore   *persistence.MySQLDurableStore
 	BusinessServer *http.Server
 	InternalServer *http.Server
 	runCtx         context.Context
@@ -28,7 +33,7 @@ type App struct {
 	runErr         error
 }
 
-func New(cfg config.Config) *App {
+func New(cfg config.Config) (*App, error) {
 	runCtx, cancel := context.WithCancel(context.Background())
 
 	rdb := redis.NewClient(&redis.Options{
@@ -43,6 +48,7 @@ func New(cfg config.Config) *App {
 
 	repo := core.NewRedisRepository(rdb)
 	core.SetDefaultRepo(repo)
+	core.SetDurableStore(nil)
 	core.ConfigureRuntime(core.RuntimeConfig{
 		RedisRepositoryTimeout: cfg.RedisRepositoryTimeout,
 		ScheduledTaskTimeout:   cfg.ScheduledTaskTimeout,
@@ -50,18 +56,84 @@ func New(cfg config.Config) *App {
 		CreateLockTTL:          cfg.LeaderboardCreateLockTTL,
 	})
 
-	readinessCheck := func(ctx context.Context) error {
-		return rdb.Ping(ctx).Err()
+	checks := []func(context.Context) error{
+		func(ctx context.Context) error {
+			return rdb.Ping(ctx).Err()
+		},
 	}
+
+	db, err := sql.Open("mysql", cfg.MySQLDSN)
+	if err != nil {
+		_ = rdb.Close()
+		cancel()
+		return nil, fmt.Errorf("open mysql durable store: %w", err)
+	}
+	db.SetMaxOpenConns(cfg.MySQLMaxOpenConns)
+	db.SetMaxIdleConns(cfg.MySQLMaxIdleConns)
+	db.SetConnMaxLifetime(cfg.MySQLConnMaxLifetime)
+
+	durableStore := persistence.NewMySQLDurableStore(db, persistence.MySQLDurableStoreOptions{
+		Logger:           slog.Default(),
+		MergeInterval:    cfg.MySQLEventMergeInterval,
+		MergeBatchSize:   cfg.MySQLEventMergeBatchSize,
+		CleanupInterval:  cfg.MySQLEventCleanupInterval,
+		CleanupRetention: cfg.MySQLEventCleanupRetention,
+		CleanupBatchSize: cfg.MySQLEventCleanupBatchSize,
+	})
+
+	initCtx, initCancel := context.WithTimeout(context.Background(), cfg.HealthcheckTimeout)
+	defer initCancel()
+	if err := durableStore.PingContext(initCtx); err != nil {
+		_ = db.Close()
+		_ = rdb.Close()
+		cancel()
+		return nil, fmt.Errorf("ping mysql durable store: %w", err)
+	}
+	if err := durableStore.EnsureSchema(initCtx); err != nil {
+		_ = db.Close()
+		_ = rdb.Close()
+		cancel()
+		return nil, fmt.Errorf("ensure mysql durable schema: %w", err)
+	}
+
+	mysqlDB := db
+	core.SetDurableStore(durableStore)
+	checks = append(checks, durableStore.PingContext)
+
+	readinessCheck := func(ctx context.Context) error {
+		for _, check := range checks {
+			if err := check(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	replayHandler := api.SystemReplayDurableHandler(func(r *http.Request, leaderboardID string) (map[string]interface{}, error) {
+		result, err := durableStore.ReplayToRedis(r.Context(), repo, leaderboardID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"status":                "replayed",
+			"scope":                 result.Scope,
+			"replayed_leaderboards": result.ReplayedLeaderboards,
+			"replayed_items":        result.ReplayedItems,
+			"removed_leaderboards":  result.RemovedLeaderboards,
+			"time":                  time.Now().Format(time.RFC3339),
+		}, nil
+	})
 
 	// 业务服务和内部服务统一在这里装配，main 只需要处理进程生命周期，
 	// 不需要关心具体的传输层细节。
 	return &App{
-		Config:      cfg,
-		RedisClient: rdb,
-		Repository:  repo,
-		runCtx:      runCtx,
-		cancel:      cancel,
+		Config:       cfg,
+		RedisClient:  rdb,
+		MySQLDB:      mysqlDB,
+		Repository:   repo,
+		DurableStore: durableStore,
+		runCtx:       runCtx,
+		cancel:       cancel,
 		BusinessServer: &http.Server{
 			Addr:              cfg.BusinessAddr,
 			Handler:           api.NewBusinessMux(cfg.HealthcheckTimeout, readinessCheck),
@@ -72,13 +144,20 @@ func New(cfg config.Config) *App {
 		},
 		InternalServer: &http.Server{
 			Addr:              cfg.InternalAddr,
-			Handler:           api.NewInternalMux(cfg.HealthcheckTimeout, readinessCheck, cfg.InternalAPIToken),
+			Handler:           api.NewInternalMux(cfg.HealthcheckTimeout, readinessCheck, cfg.InternalAPIToken, replayHandler),
 			ReadHeaderTimeout: cfg.HTTPReadHeaderTimeout,
 			ReadTimeout:       cfg.HTTPReadTimeout,
 			WriteTimeout:      cfg.HTTPWriteTimeout,
 			IdleTimeout:       cfg.HTTPIdleTimeout,
 		},
+	}, nil
+}
+
+func (a *App) ReplayDurableState(ctx context.Context, leaderboardID string) (persistence.ReplayResult, error) {
+	if a.DurableStore == nil {
+		return persistence.ReplayResult{}, fmt.Errorf("mysql durable store is not configured")
 	}
+	return a.DurableStore.ReplayToRedis(ctx, a.Repository, leaderboardID)
 }
 
 func (a *App) Done() <-chan struct{} {
@@ -115,6 +194,10 @@ func (a *App) Start(ctx context.Context) {
 				<-ctx.Done()
 				a.cancel()
 			}()
+		}
+
+		if a.DurableStore != nil {
+			a.DurableStore.Start(a.runCtx)
 		}
 
 		go func() {
@@ -156,6 +239,18 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if err := a.RedisClient.Close(); err != nil {
 		slog.Error("close redis client failed", "error", err)
 		errs = append(errs, err)
+	}
+	if a.DurableStore != nil {
+		if err := a.DurableStore.Shutdown(ctx); err != nil {
+			slog.Error("stop mysql durable store failed", "error", err)
+			errs = append(errs, err)
+		}
+	}
+	if a.MySQLDB != nil {
+		if err := a.MySQLDB.Close(); err != nil {
+			slog.Error("close mysql durable db failed", "error", err)
+			errs = append(errs, err)
+		}
 	}
 
 	return errors.Join(errs...)

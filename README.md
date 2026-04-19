@@ -1,6 +1,6 @@
 # 高性能热点榜单微服务
 
-基于 Go 与 Redis 构建的高性能排行榜微服务，面向分布式系统中的热点数据计算、存储与查询场景设计。服务支持动态评分表达式、实时榜与定时榜两种刷新模式，并通过缓存存储、批量重算、并发保护、分布式锁与分层调度等多种机制，提升高并发场景下的处理效率、数据一致性与服务稳定性，并具备健康检查、指标暴露、容器化部署及 Kubernetes 集成等基础工程能力。
+基于 Go、Redis 与 MySQL 构建的高性能排行榜微服务，面向分布式系统中的热点数据计算、存储与查询场景设计。服务支持动态评分表达式、实时榜与定时榜两种刷新模式，并通过 Redis 热路径、MySQL 持久化事件日志与快照、批量重算、并发保护、分布式锁与分层调度等多种机制，提升高并发场景下的处理效率、数据一致性与服务稳定性，并具备健康检查、指标暴露、容器化部署及 Kubernetes 集成等基础工程能力。
 
 ## 功能概览
 
@@ -89,15 +89,17 @@
 
 当前结构分层重点：
 
-- `internal/app`：应用装配、Redis 初始化、HTTP Server 生命周期管理
+- `internal/app`：应用装配、Redis/MySQL 初始化、HTTP Server 生命周期管理
 - `internal/api`：路由、HTTP Handler、健康检查、HTTP 指标
 - `internal/config`：环境变量配置加载
 - `internal/core`：排行榜核心逻辑、Redis 仓储、调度器、核心指标
+- `internal/persistence`：MySQL durable event log、snapshot merge、Redis replay
 
 ## 运行要求
 
 - Go `1.25+`
 - Redis `6+`
+- MySQL `8.0+`
 
 ## 环境变量
 
@@ -127,6 +129,27 @@
 - `REDIS_REPOSITORY_TIMEOUT`
   默认值：`800ms`
 
+### MySQL 持久化
+
+- `MYSQL_DSN`
+  必填，例如：`leaderboard:secret@tcp(localhost:3306)/leaderboard?parseTime=true&charset=utf8mb4,utf8`
+- `MYSQL_MAX_OPEN_CONNS`
+  默认值：`20`
+- `MYSQL_MAX_IDLE_CONNS`
+  默认值：`5`
+- `MYSQL_CONN_MAX_LIFETIME`
+  默认值：`30m`
+- `MYSQL_EVENT_MERGE_INTERVAL`
+  默认值：`1s`
+- `MYSQL_EVENT_MERGE_BATCH_SIZE`
+  默认值：`500`
+- `MYSQL_EVENT_CLEANUP_INTERVAL`
+  默认值：`1m`
+- `MYSQL_EVENT_CLEANUP_RETENTION`
+  默认值：`24h`
+- `MYSQL_EVENT_CLEANUP_BATCH_SIZE`
+  默认值：`1000`
+
 ### HTTP 与生命周期
 
 - `HTTP_READ_HEADER_TIMEOUT`
@@ -155,6 +178,24 @@
 
 ## 本地启动
 
+仓库根目录提供了本地开发用的 `.env` 与可提交的 `.env.example`。
+
+注意：
+
+- `docker compose` 会自动读取根目录 `.env`
+- `go run .` 不会自动加载 `.env`，需要你先把变量注入到当前 shell，或使用支持 dotenv 的工具
+
+PowerShell 示例：
+
+```powershell
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*#' -or $_ -match '^\s*$') { return }
+  $name, $value = $_ -split '=', 2
+  [System.Environment]::SetEnvironmentVariable($name, $value, 'Process')
+}
+go run .
+```
+
 ```powershell
 go run .
 ```
@@ -164,6 +205,8 @@ go run .
 - `:8080` 业务接口
 - `:9090` 内部接口
 
+如果没有配置 `MYSQL_DSN`，服务会在启动阶段直接失败，而不是退回到“仅 Redis 持久化”模式。
+
 ## 健康检查
 
 业务端口与内部端口均提供以下接口：
@@ -171,9 +214,9 @@ go run .
 - `GET /livez`
   存活检查
 - `GET /readyz`
-  就绪检查，会检查 Redis 连通性
+  就绪检查，会检查 Redis 与 MySQL 连通性
 - `GET /healthz`
-  综合健康检查，会检查 Redis 连通性
+  综合健康检查，会检查 Redis 与 MySQL 连通性
 
 ## 端口职责
 
@@ -195,6 +238,7 @@ go run .
 
 - `GET /metrics`
 - `POST /system/cron/tick`
+- `POST /system/durable/replay`
 - 健康检查接口
 
 ## HTTP API
@@ -325,6 +369,31 @@ go run .
 - 该接口仅挂在内部端口
 - 适合内部运维触发、联调和调度补偿
 
+### 9. 从 MySQL 快照重建 Redis
+
+`POST /system/durable/replay`
+
+请求示例：
+
+```json
+{}
+```
+
+或只重建单个榜单：
+
+```json
+{
+  "leaderboard_id": "top_videos"
+}
+```
+
+说明：
+
+- 该接口仅挂在内部端口
+- 会按 MySQL 快照覆盖 Redis 当前状态
+- `scheduled` 榜单恢复后会重新标记 dirty，等待调度器或手动重算补齐 score
+- 建议在 Redis 故障恢复、缓存预热或运维补偿时使用
+
 
 ## 核心实现说明
 
@@ -350,6 +419,22 @@ go run .
 - 批量重算发生部分失败时返回错误，不再伪装为成功
 - dirty 条目通过 `SSCAN` 分批扫描
 - 脏条目缺失或损坏时会在重算过程中清理
+- 业务写操作会先追加 MySQL durable event，再写 Redis 热路径
+
+### 持久化与恢复
+
+当前持久化模型：
+
+- `leaderboard_events`：MySQL append-only 业务事件日志
+- `leaderboards`：排行榜定义快照
+- `leaderboard_items`：每个 `(leaderboard_id, item_id)` 的最终快照
+- `event_consumers`：后台 merge worker 的 checkpoint
+
+恢复策略：
+
+- Redis 继续承担在线读写、锁、dirty 集合和排序集合
+- MySQL 持有 durable source
+- 当 Redis 丢失或需要重建时，通过内部 replay 接口把 MySQL 快照重新投影回 Redis
 
 ### 调度器
 
@@ -402,7 +487,95 @@ docker build -t leaderboard-service:latest .
 ```
 docker run --rm -p 8080:8080 -p 9090:9090 `
   -e REDIS_ADDR=host.docker.internal:6379 `
+  -e MYSQL_DSN="leaderboard:secret@tcp(host.docker.internal:3306)/leaderboard?parseTime=true&charset=utf8mb4,utf8" `
   leaderboard-service:latest
+```
+
+## Docker Compose
+
+仓库根目录提供了一个本地联调用的 `docker-compose.yml`，默认拉起：
+
+- `app`
+- `redis`
+- `mysql`
+
+其中：
+
+- `.env` 里的 `MYSQL_DSN` 默认给本地直接运行使用，主机名是 `localhost`
+- `docker-compose.yml` 内部会使用 `COMPOSE_MYSQL_DSN` / `COMPOSE_REDIS_ADDR` 的默认值，让容器间互相走 `mysql`、`redis` 服务名
+
+启动：
+
+```powershell
+docker compose up --build
+```
+
+后台启动：
+
+```powershell
+docker compose up -d --build
+```
+
+默认端口：
+
+- 业务接口：`http://127.0.0.1:8080`
+- 内部接口：`http://127.0.0.1:9090`
+- Redis：`127.0.0.1:6379`
+- MySQL：`127.0.0.1:3306`
+
+默认本地联调凭据：
+
+- MySQL DB：`leaderboard`
+- MySQL User：`leaderboard`
+- MySQL Password：`leaderboard`
+- MySQL Root Password：`root`
+- Internal Token：`dev-internal-token`
+
+停止并保留数据卷：
+
+```powershell
+docker compose down
+```
+
+停止并删除数据卷：
+
+```powershell
+docker compose down -v
+```
+
+MySQL 和 Redis 都使用 named volume 持久化，因此默认情况下重启 compose 不会丢本地数据。
+
+### Compose 快速验证
+
+创建一个实时榜：
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8080/leaderboard" `
+  -H "Content-Type: application/json" `
+  -d "{\"id\":\"top_videos\",\"expression\":\"views * 1 + likes * 10\",\"schema\":{\"views\":0,\"likes\":0},\"refresh_policy\":\"realtime\"}"
+```
+
+写入条目：
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8080/leaderboard/top_videos/item" `
+  -H "Content-Type: application/json" `
+  -d "{\"item_id\":\"video_123\",\"data\":{\"views\":1000,\"likes\":50}}"
+```
+
+查看榜单：
+
+```powershell
+curl.exe "http://127.0.0.1:8080/leaderboard/top_videos?n=10"
+```
+
+从 MySQL 快照重建全部 Redis 数据：
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:9090/system/durable/replay" `
+  -H "X-Internal-Token: dev-internal-token" `
+  -H "Content-Type: application/json" `
+  -d "{}"
 ```
 
 ## Kubernetes
@@ -422,6 +595,7 @@ docker run --rm -p 8080:8080 -p 9090:9090 `
 - `leaderboard-internal` 暴露内部端口 `9090`
 - Pod 上带有 Prometheus 抓取注解
 - 使用 readiness/liveness/startup probe
+- 业务服务默认要求可访问的 MySQL 实例
 
 ### 部署
 
@@ -448,6 +622,8 @@ go test ./...
 ```powershell
 $env:GOCACHE="$PWD\\.gocache"
 $env:GOTMPDIR="$PWD\\.gotmp"
+$env:GOMODCACHE="$PWD\\.gomodcache"
+$env:GOSUMDB="off"
 go test ./...
 ```
 

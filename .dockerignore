@@ -4,6 +4,7 @@
 .claude
 .gocache
 .gotmp
+.gomodcache
 trendingList.exe
 vendor
 *.log

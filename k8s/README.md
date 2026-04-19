@@ -4,11 +4,14 @@
 
 本目录包含排行榜服务及其 Redis 依赖的 Kubernetes 部署清单。
 
+当前版本里，MySQL 已经是业务服务的必需依赖，但仓库内没有直接提供 MySQL StatefulSet 清单；默认假设你会接入现有 MySQL 实例或单独维护数据库部署。
+
 部署前检查以下内容：
 
 - 命名空间名称
 - 业务镜像地址和标签
 - Redis 部署方式
+- MySQL 接入方式
 - 集群内访问方式
 - 集群外暴露方式
 - 节点是否需要代理拉取镜像
@@ -19,12 +22,13 @@
 - `namespace.yaml`：命名空间
 - `configmap.yaml`：运行时环境变量
 - `secret.yaml`：敏感配置，例如 Redis 密码
+- `secret.yaml`：敏感配置，例如 Redis 密码、内部 token、MySQL DSN
 - `service.yaml`：业务口和内部口 Service
 - `deployment.yaml`：业务 Deployment
 - `redis.yaml`：Redis ConfigMap、Service、StatefulSet 与持久化卷声明
 - `kustomization.yaml`：`kubectl apply -k` 入口
 
-当前清单覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源。Redis 使用单副本 `StatefulSet` 和 PVC 持久化 `/data` 目录。
+当前清单覆盖排行榜服务、Redis 依赖、Service 暴露、健康检查及基础部署资源。Redis 使用单副本 `StatefulSet` 和 PVC 持久化 `/data` 目录；MySQL 连接信息通过 `Secret` 注入。
 
 ## Redis 持久化说明
 
@@ -55,6 +59,16 @@ Redis 部署特性：
 ```text
 redis:6379
 ```
+
+### 2.1 MySQL DSN
+
+`secret.yaml` 中必须提供有效的 `MYSQL_DSN`，例如：
+
+```text
+leaderboard:change-me@tcp(mysql:3306)/leaderboard?parseTime=true&charset=utf8mb4,utf8
+```
+
+如果 MySQL 服务名、端口、库名或鉴权方式不同，需要在部署前调整。
 
 ### 2.1 StorageClass
 
@@ -182,6 +196,11 @@ curl -i http://<access-address>/livez
 curl -i http://<access-address>/readyz
 ```
 
+说明：
+
+- `readyz` / `healthz` 同时检查 Redis 和 MySQL
+- 如果其中任一依赖不可用，Pod 会保持不 Ready
+
 ### 2. 创建排行榜
 
 ```bash
@@ -233,6 +252,24 @@ kubectl -n <namespace> port-forward svc/<internal-service-name> 9090:9090
 ```bash
 curl -i http://127.0.0.1:9090/healthz
 curl -i http://127.0.0.1:9090/metrics
+```
+
+触发从 MySQL 快照重建 Redis：
+
+```bash
+curl -sS -X POST http://127.0.0.1:9090/system/durable/replay \
+  -H "X-Internal-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+只重建单个榜单：
+
+```bash
+curl -sS -X POST http://127.0.0.1:9090/system/durable/replay \
+  -H "X-Internal-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"leaderboard_id":"top_videos"}'
 ```
 
 ## 常用操作
@@ -313,6 +350,23 @@ kubectl -n <namespace> get endpoints <redis-service-name> -o wide
 kubectl -n <namespace> get pvc
 ```
 
+### 3.1 MySQL 连不上
+
+优先确认：
+
+- `MYSQL_DSN` 是否正确
+- Pod 到 MySQL 的网络是否可达
+- 数据库用户是否拥有建表和读写权限
+- 目标数据库是否已创建
+
+常用命令：
+
+```bash
+kubectl -n <namespace> describe pod <pod-name>
+kubectl -n <namespace> logs <pod-name> --tail=100
+kubectl -n <namespace> get secret leaderboard-secret -o yaml
+```
+
 ## 数据恢复验证
 
 完成部署并写入排行榜数据后，可执行以下持久化验证：
@@ -330,7 +384,19 @@ kubectl -n <namespace> rollout status statefulset/redis
 kubectl -n <namespace> get pvc
 ```
 
-PVC 保持 `Bound`，且业务数据在 Pod 重建后仍可查询时，说明 Redis 持久化链路生效。
+PVC 保持 `Bound`，且业务数据在 Pod 重建后仍可查询时，说明 Redis 本地持久化链路生效。
+
+如果 Redis 数据已经丢失或你希望按 MySQL 快照强制重建，可执行：
+
+```bash
+kubectl -n <namespace> port-forward svc/<internal-service-name> 9090:9090
+curl -sS -X POST http://127.0.0.1:9090/system/durable/replay \
+  -H "X-Internal-Token: <token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+返回 `replayed` 后，再重新查询业务接口确认数据已回到 Redis。
 
 ### 4. 多节点下网络异常
 

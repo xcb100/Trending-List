@@ -1,6 +1,9 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -20,4 +23,31 @@ func SystemCronTickHandler(w http.ResponseWriter, r *http.Request) {
 		"status": "ticked_all_tiers",
 		"time":   time.Now().Format(time.RFC3339),
 	})
+}
+
+type SystemReplayRequest struct {
+	LeaderboardID string `json:"leaderboard_id"`
+}
+
+type ReplayFunc func(r *http.Request, leaderboardID string) (map[string]interface{}, error)
+
+func SystemReplayDurableHandler(replay ReplayFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req SystemReplayRequest
+		if r.Body != nil {
+			err := json.NewDecoder(r.Body).Decode(&req)
+			if err != nil && !errors.Is(err, io.EOF) {
+				sendError(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+		}
+
+		payload, err := replay(r, req.LeaderboardID)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "system replay failed: "+err.Error())
+			return
+		}
+
+		sendJSON(w, http.StatusOK, payload)
+	}
 }

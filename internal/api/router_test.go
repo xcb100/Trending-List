@@ -9,7 +9,7 @@ import (
 )
 
 func TestInternalMuxProtectsCronTickWhenTokenConfigured(t *testing.T) {
-	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token")
+	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token", func(w http.ResponseWriter, r *http.Request) {})
 
 	req := httptest.NewRequest(http.MethodPost, "/system/cron/tick", nil)
 	rec := httptest.NewRecorder()
@@ -22,7 +22,7 @@ func TestInternalMuxProtectsCronTickWhenTokenConfigured(t *testing.T) {
 }
 
 func TestInternalMuxAllowsHealthAndMetricsWithoutToken(t *testing.T) {
-	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token")
+	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token", func(w http.ResponseWriter, r *http.Request) {})
 
 	for _, tc := range []struct {
 		method string
@@ -44,7 +44,7 @@ func TestInternalMuxAllowsHealthAndMetricsWithoutToken(t *testing.T) {
 }
 
 func TestInternalMuxPassesAuthorizedCronTickRequests(t *testing.T) {
-	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token")
+	mux := NewInternalMux(time.Second, func(context.Context) error { return nil }, "expected-token", func(w http.ResponseWriter, r *http.Request) {})
 
 	req := httptest.NewRequest(http.MethodPost, "/system/cron/tick", nil)
 	req.Header.Set("X-Internal-Token", "expected-token")
