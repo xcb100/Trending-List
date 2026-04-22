@@ -77,6 +77,75 @@ func (m *mockRepo) SaveItemData(ctx context.Context, lbID string, itemID string,
 	return nil
 }
 
+func (m *mockRepo) MutateItemData(ctx context.Context, lbID string, itemID string, ops []core.FieldMutation, expectedUpdatedAt time.Time, newUpdatedAt time.Time, markDirty bool) (*core.Item, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item := m.items[lbID][itemID]
+	if item == nil {
+		return nil, core.ErrItemNotFound
+	}
+	if !item.UpdatedAt.Equal(expectedUpdatedAt) {
+		return nil, core.ErrMutationConflict
+	}
+
+	nextData := make(map[string]interface{}, len(item.Data))
+	for k, v := range item.Data {
+		nextData[k] = v
+	}
+
+	for _, op := range ops {
+		raw, ok := nextData[op.Field]
+		if !ok {
+			return nil, errors.New("field not found")
+		}
+		value, ok := raw.(float64)
+		if !ok {
+			return nil, errors.New("field not numeric")
+		}
+		if op.Op == "inc" {
+			nextData[op.Field] = value + op.Value
+		} else {
+			nextData[op.Field] = value - op.Value
+		}
+	}
+
+	item.Data = nextData
+	item.UpdatedAt = newUpdatedAt
+	if markDirty {
+		if m.dirty[lbID] == nil {
+			m.dirty[lbID] = make(map[string]bool)
+		}
+		m.dirty[lbID][itemID] = true
+	}
+
+	return &core.Item{
+		ID:        item.ID,
+		Data:      nextData,
+		Score:     item.Score,
+		UpdatedAt: item.UpdatedAt,
+	}, nil
+}
+
+func (m *mockRepo) CommitMutatedRealtimeScore(ctx context.Context, lbID string, itemID string, score float64, expectedUpdatedAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	item := m.items[lbID][itemID]
+	if item == nil {
+		return core.ErrItemNotFound
+	}
+	if !item.UpdatedAt.Equal(expectedUpdatedAt) {
+		return core.ErrMutationConflict
+	}
+
+	item.Score = score
+	if m.dirty[lbID] != nil {
+		delete(m.dirty[lbID], itemID)
+	}
+	return nil
+}
+
 func (m *mockRepo) UpdateItemScore(ctx context.Context, lbID string, itemID string, score float64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -329,6 +398,55 @@ func TestLeaderboard_ScheduledPolicy(t *testing.T) {
 	dirtyIDsAfter, _ := repo.GetDirtyItemIDs(ctx, "test_cron")
 	if len(dirtyIDsAfter) != 0 {
 		t.Errorf("expected dirty items to be empty, got %v", dirtyIDsAfter)
+	}
+}
+
+func TestLeaderboard_MutateItemRealtimeAndScheduled(t *testing.T) {
+	ctx := context.Background()
+
+	realtimeRepo := newMockRepo()
+	realtimeLB, err := core.CreateLeaderboard(ctx, "mutate_realtime", "likes * 2 + views", map[string]interface{}{"likes": 0.0, "views": 0.0}, core.RefreshPolicyRealtime, "", realtimeRepo)
+	if err != nil {
+		t.Fatalf("create realtime leaderboard: %v", err)
+	}
+	if _, err := realtimeLB.UpsertItem(ctx, "item1", map[string]interface{}{"likes": 10.0, "views": 5.0}); err != nil {
+		t.Fatalf("upsert realtime item: %v", err)
+	}
+
+	mutatedRealtime, err := realtimeLB.MutateItem(ctx, "item1", []core.FieldMutation{
+		{Field: "likes", Op: "inc", Value: 2},
+		{Field: "views", Op: "dec", Value: 1},
+	})
+	if err != nil {
+		t.Fatalf("mutate realtime item: %v", err)
+	}
+	if mutatedRealtime.Data["likes"] != 12.0 || mutatedRealtime.Data["views"] != 4.0 {
+		t.Fatalf("unexpected realtime mutated data: %+v", mutatedRealtime.Data)
+	}
+	if mutatedRealtime.Score != 28.0 {
+		t.Fatalf("expected realtime score 28, got %f", mutatedRealtime.Score)
+	}
+
+	scheduledRepo := newMockRepo()
+	scheduledLB, err := core.CreateLeaderboard(ctx, "mutate_scheduled", "likes * 3", map[string]interface{}{"likes": 0.0}, core.RefreshPolicyScheduled, "@every 10s", scheduledRepo)
+	if err != nil {
+		t.Fatalf("create scheduled leaderboard: %v", err)
+	}
+	if _, err := scheduledLB.UpsertItem(ctx, "item2", map[string]interface{}{"likes": 5.0}); err != nil {
+		t.Fatalf("upsert scheduled item: %v", err)
+	}
+	mutatedScheduled, err := scheduledLB.MutateItem(ctx, "item2", []core.FieldMutation{
+		{Field: "likes", Op: "inc", Value: 3},
+	})
+	if err != nil {
+		t.Fatalf("mutate scheduled item: %v", err)
+	}
+	if mutatedScheduled.Data["likes"] != 8.0 {
+		t.Fatalf("unexpected scheduled mutated data: %+v", mutatedScheduled.Data)
+	}
+	dirty, _ := scheduledRepo.GetDirtyItemIDs(ctx, "mutate_scheduled")
+	if len(dirty) != 1 || dirty[0] != "item2" {
+		t.Fatalf("expected scheduled mutated item to be dirty, got %v", dirty)
 	}
 }
 

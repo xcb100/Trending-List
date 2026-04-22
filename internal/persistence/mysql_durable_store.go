@@ -86,6 +86,13 @@ type itemSnapshotRow struct {
 	LastEventID   int64
 }
 
+type itemBatchState struct {
+	mutation itemSnapshotMutation
+	loaded   bool
+	exists   bool
+	changed  bool
+}
+
 type ReplayResult struct {
 	Scope                string `json:"scope"`
 	ReplayedLeaderboards int    `json:"replayed_leaderboards"`
@@ -389,25 +396,24 @@ func (s *MySQLDurableStore) mergeBatch(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
-	itemMutations, err := aggregateItemMutations(events)
-	if err != nil {
-		return 0, err
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("begin mysql snapshot merge tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	itemStates := make(map[itemMutationKey]*itemBatchState)
 	for _, event := range events {
-		if err := s.applyLeaderboardEvent(ctx, tx, event); err != nil {
+		if err := s.applyEvent(ctx, tx, event, itemStates); err != nil {
 			return 0, err
 		}
 	}
 
-	for _, mutation := range itemMutations {
-		if err := s.applyItemMutation(ctx, tx, mutation); err != nil {
+	for _, state := range itemStates {
+		if !state.changed {
+			continue
+		}
+		if err := s.applyItemMutation(ctx, tx, state.mutation); err != nil {
 			return 0, err
 		}
 	}
@@ -562,6 +568,36 @@ func aggregateItemMutations(events []durableEventRow) (map[itemMutationKey]itemS
 				Score:         score,
 				ItemUpdatedAt: payload.UpdatedAt.UTC(),
 				IsDeleted:     payload.IsDeleted,
+				LastEventID:   event.ID,
+			}
+		case core.DurableOpItemMutate:
+			if !event.ItemID.Valid {
+				return nil, fmt.Errorf("item mutate event %d missing item id", event.ID)
+			}
+
+			var payload core.DurableItemMutationPayload
+			if err := json.Unmarshal(event.Payload, &payload); err != nil {
+				return nil, fmt.Errorf("decode item mutate event %d: %w", event.ID, err)
+			}
+
+			dataJSON, err := json.Marshal(payload.Data)
+			if err != nil {
+				return nil, fmt.Errorf("marshal item mutate snapshot for event %d: %w", event.ID, err)
+			}
+
+			score := sql.NullFloat64{}
+			if payload.Score != nil {
+				score = sql.NullFloat64{Float64: *payload.Score, Valid: true}
+			}
+
+			key := itemMutationKey{leaderboardID: event.LeaderboardID, itemID: event.ItemID.String}
+			mutations[key] = itemSnapshotMutation{
+				LeaderboardID: event.LeaderboardID,
+				ItemID:        event.ItemID.String,
+				DataJSON:      dataJSON,
+				Score:         score,
+				ItemUpdatedAt: payload.UpdatedAt.UTC(),
+				IsDeleted:     false,
 				LastEventID:   event.ID,
 			}
 		case core.DurableOpItemDelete:
@@ -783,6 +819,153 @@ func (s *MySQLDurableStore) applyLeaderboardEvent(ctx context.Context, tx *sql.T
 	}
 
 	return nil
+}
+
+func (s *MySQLDurableStore) applyEvent(ctx context.Context, tx *sql.Tx, event durableEventRow, itemStates map[itemMutationKey]*itemBatchState) error {
+	switch event.Operation {
+	case core.DurableOpLeaderboardUpsert, core.DurableOpLeaderboardDelete:
+		return s.applyLeaderboardEvent(ctx, tx, event)
+	case core.DurableOpItemUpsert, core.DurableOpItemDelete, core.DurableOpItemMutate:
+		return s.applyItemEvent(ctx, tx, event, itemStates)
+	default:
+		return nil
+	}
+}
+
+func (s *MySQLDurableStore) applyItemEvent(ctx context.Context, tx *sql.Tx, event durableEventRow, itemStates map[itemMutationKey]*itemBatchState) error {
+	if !event.ItemID.Valid {
+		return fmt.Errorf("item event %d missing item id", event.ID)
+	}
+
+	key := itemMutationKey{leaderboardID: event.LeaderboardID, itemID: event.ItemID.String}
+	state, err := s.loadItemBatchState(ctx, tx, key, itemStates)
+	if err != nil {
+		return err
+	}
+
+	switch event.Operation {
+	case core.DurableOpItemUpsert:
+		var payload core.DurableItemPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode item upsert event %d: %w", event.ID, err)
+		}
+		dataJSON, err := json.Marshal(payload.Data)
+		if err != nil {
+			return fmt.Errorf("marshal item snapshot for event %d: %w", event.ID, err)
+		}
+		score := sql.NullFloat64{}
+		if payload.Score != nil {
+			score = sql.NullFloat64{Float64: *payload.Score, Valid: true}
+		}
+		state.mutation = itemSnapshotMutation{
+			LeaderboardID: event.LeaderboardID,
+			ItemID:        event.ItemID.String,
+			DataJSON:      dataJSON,
+			Score:         score,
+			ItemUpdatedAt: payload.UpdatedAt.UTC(),
+			IsDeleted:     payload.IsDeleted,
+			LastEventID:   event.ID,
+		}
+		state.loaded = true
+		state.exists = true
+		state.changed = true
+	case core.DurableOpItemDelete:
+		state.mutation = itemSnapshotMutation{
+			LeaderboardID: event.LeaderboardID,
+			ItemID:        event.ItemID.String,
+			DataJSON:      []byte(`{}`),
+			Score:         sql.NullFloat64{},
+			ItemUpdatedAt: event.CreatedAt.UTC(),
+			IsDeleted:     true,
+			LastEventID:   event.ID,
+		}
+		state.loaded = true
+		state.exists = true
+		state.changed = true
+	case core.DurableOpItemMutate:
+		var payload core.DurableItemMutationPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode item mutate event %d: %w", event.ID, err)
+		}
+		if !state.exists || state.mutation.IsDeleted || !state.mutation.ItemUpdatedAt.Equal(payload.ExpectedUpdatedAt.UTC()) {
+			return nil
+		}
+		dataJSON, err := json.Marshal(payload.Data)
+		if err != nil {
+			return fmt.Errorf("marshal item mutate snapshot for event %d: %w", event.ID, err)
+		}
+		score := sql.NullFloat64{}
+		if payload.Score != nil {
+			score = sql.NullFloat64{Float64: *payload.Score, Valid: true}
+		}
+		state.mutation = itemSnapshotMutation{
+			LeaderboardID: event.LeaderboardID,
+			ItemID:        event.ItemID.String,
+			DataJSON:      dataJSON,
+			Score:         score,
+			ItemUpdatedAt: payload.UpdatedAt.UTC(),
+			IsDeleted:     false,
+			LastEventID:   event.ID,
+		}
+		state.loaded = true
+		state.exists = true
+		state.changed = true
+	}
+
+	return nil
+}
+
+func (s *MySQLDurableStore) loadItemBatchState(ctx context.Context, tx *sql.Tx, key itemMutationKey, itemStates map[itemMutationKey]*itemBatchState) (*itemBatchState, error) {
+	if state, ok := itemStates[key]; ok {
+		return state, nil
+	}
+
+	row, found, err := s.fetchItemSnapshotInTx(ctx, tx, key.leaderboardID, key.itemID)
+	if err != nil {
+		return nil, err
+	}
+
+	state := &itemBatchState{loaded: true, exists: found}
+	if found {
+		state.mutation = itemSnapshotMutation{
+			LeaderboardID: row.LeaderboardID,
+			ItemID:        row.ItemID,
+			DataJSON:      row.DataJSON,
+			Score:         row.Score,
+			ItemUpdatedAt: row.ItemUpdatedAt,
+			IsDeleted:     row.IsDeleted,
+			LastEventID:   row.LastEventID,
+		}
+	}
+	itemStates[key] = state
+	return state, nil
+}
+
+func (s *MySQLDurableStore) fetchItemSnapshotInTx(ctx context.Context, tx *sql.Tx, leaderboardID string, itemID string) (itemSnapshotRow, bool, error) {
+	var row itemSnapshotRow
+	err := tx.QueryRowContext(
+		ctx,
+		`SELECT leaderboard_id, item_id, data_json, score, item_updated_at, is_deleted, last_event_id
+		 FROM leaderboard_items
+		 WHERE leaderboard_id = ? AND item_id = ?`,
+		leaderboardID,
+		itemID,
+	).Scan(
+		&row.LeaderboardID,
+		&row.ItemID,
+		&row.DataJSON,
+		&row.Score,
+		&row.ItemUpdatedAt,
+		&row.IsDeleted,
+		&row.LastEventID,
+	)
+	if err == nil {
+		return row, true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return itemSnapshotRow{}, false, nil
+	}
+	return itemSnapshotRow{}, false, fmt.Errorf("query item snapshot for %s/%s in tx: %w", leaderboardID, itemID, err)
 }
 
 func (s *MySQLDurableStore) applyItemMutation(ctx context.Context, tx *sql.Tx, mutation itemSnapshotMutation) error {

@@ -11,6 +11,8 @@ type Repository interface {
 	DeleteLeaderboard(ctx context.Context, lbID string) error
 
 	SaveItemData(ctx context.Context, lbID string, itemID string, data map[string]interface{}, updatedAt time.Time) error
+	MutateItemData(ctx context.Context, lbID string, itemID string, ops []FieldMutation, expectedUpdatedAt time.Time, newUpdatedAt time.Time, markDirty bool) (*Item, error)
+	CommitMutatedRealtimeScore(ctx context.Context, lbID string, itemID string, score float64, expectedUpdatedAt time.Time) error
 	UpdateItemScore(ctx context.Context, lbID string, itemID string, score float64) error
 	UpsertItem(ctx context.Context, lbID string, itemID string, score float64, data map[string]interface{}, updatedAt time.Time) error
 	DeleteItem(ctx context.Context, lbID string, itemID string) error

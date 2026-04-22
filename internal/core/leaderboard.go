@@ -33,6 +33,12 @@ type DataPayload struct {
 	UpdatedAt time.Time              `json:"updated_at"`
 }
 
+type FieldMutation struct {
+	Field string  `json:"field"`
+	Op    string  `json:"op"`
+	Value float64 `json:"value"`
+}
+
 type Leaderboard struct {
 	mu               sync.RWMutex
 	ID               string
@@ -78,10 +84,12 @@ var (
 
 var (
 	ErrLeaderboardNotFound = errors.New("leaderboard not found")
+	ErrItemNotFound        = errors.New("item not found")
 	ErrLeaderboardExists   = errors.New("leaderboard already exists")
 	ErrRestoreFailed       = errors.New("leaderboard restore failed")
 	ErrRecomputeFailed     = errors.New("leaderboard recompute failed")
 	ErrRecomputeInProgress = errors.New("leaderboard recompute already in progress")
+	ErrMutationConflict    = errors.New("item mutation conflict")
 )
 
 func cloneMap(src map[string]interface{}) map[string]interface{} {
@@ -93,6 +101,56 @@ func cloneMap(src map[string]interface{}) map[string]interface{} {
 		dst[k] = v
 	}
 	return dst
+}
+
+func applyFieldMutations(data map[string]interface{}, ops []FieldMutation) (map[string]interface{}, error) {
+	next := cloneMap(data)
+	for _, op := range ops {
+		current, ok := next[op.Field]
+		if !ok {
+			return nil, fmt.Errorf("field %s not found", op.Field)
+		}
+
+		var currentValue float64
+		switch value := current.(type) {
+		case float64:
+			currentValue = value
+		case float32:
+			currentValue = float64(value)
+		case int:
+			currentValue = float64(value)
+		case int64:
+			currentValue = float64(value)
+		case int32:
+			currentValue = float64(value)
+		case int16:
+			currentValue = float64(value)
+		case int8:
+			currentValue = float64(value)
+		case uint:
+			currentValue = float64(value)
+		case uint64:
+			currentValue = float64(value)
+		case uint32:
+			currentValue = float64(value)
+		case uint16:
+			currentValue = float64(value)
+		case uint8:
+			currentValue = float64(value)
+		default:
+			return nil, fmt.Errorf("field %s is not numeric", op.Field)
+		}
+
+		switch op.Op {
+		case "inc":
+			next[op.Field] = currentValue + op.Value
+		case "dec":
+			next[op.Field] = currentValue - op.Value
+		default:
+			return nil, fmt.Errorf("unsupported mutation op %q", op.Op)
+		}
+	}
+	return next, nil
 }
 
 func leaderboardCreateLockKey(id string) string {
@@ -530,6 +588,76 @@ func (lb *Leaderboard) UpsertItem(ctx context.Context, id string, data map[strin
 	}
 	recordUpsert(snapshot.RefreshPolicy, "success")
 	return &Item{ID: id, Data: data, Score: score, UpdatedAt: ts}, nil
+}
+
+func (lb *Leaderboard) MutateItem(ctx context.Context, itemID string, ops []FieldMutation) (*Item, error) {
+	snapshot := lb.snapshot()
+	currentItem, err := lb.repo.GetItem(ctx, snapshot.ID, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("load item before mutate: %w", err)
+	}
+	if currentItem == nil {
+		return nil, fmt.Errorf("%w: leaderboard_id=%s item_id=%s", ErrItemNotFound, snapshot.ID, itemID)
+	}
+
+	nextData, err := applyFieldMutations(currentItem.Data, ops)
+	if err != nil {
+		return nil, err
+	}
+
+	updatedAt := time.Now().UTC()
+	var nextScore *float64
+	if snapshot.RefreshPolicy == RefreshPolicyRealtime {
+		score, err := evaluateScoreWithProgram(snapshot.program, nextData, updatedAt)
+		if err != nil {
+			return nil, err
+		}
+		nextScore = &score
+	}
+
+	if err := appendItemMutateEvent(ctx, snapshot.ID, itemID, ops, currentItem.UpdatedAt, nextData, updatedAt, nextScore); err != nil {
+		return nil, fmt.Errorf("append durable item mutate event: %w", err)
+	}
+
+	item, err := lb.repo.MutateItemData(ctx, snapshot.ID, itemID, ops, currentItem.UpdatedAt, updatedAt, snapshot.RefreshPolicy == RefreshPolicyScheduled)
+	if err != nil {
+		return nil, fmt.Errorf("mutate item data: %w", err)
+	}
+
+	if snapshot.RefreshPolicy == RefreshPolicyScheduled {
+		item.Score = 0
+		return item, nil
+	}
+
+	score := *nextScore
+	const maxScoreCommitAttempts = 3
+	for attempt := 0; attempt < maxScoreCommitAttempts; attempt++ {
+		if err := lb.repo.CommitMutatedRealtimeScore(ctx, snapshot.ID, itemID, score, item.UpdatedAt); err == nil {
+			item.Score = score
+			return item, nil
+		} else if !errors.Is(err, ErrMutationConflict) {
+			return nil, fmt.Errorf("commit mutated realtime score: %w", err)
+		}
+
+		latestItem, latestErr := lb.repo.GetItem(ctx, snapshot.ID, itemID)
+		if latestErr != nil {
+			return nil, fmt.Errorf("reload item after mutation conflict: %w", latestErr)
+		}
+		if latestItem == nil {
+			return nil, fmt.Errorf("%w: leaderboard_id=%s item_id=%s", ErrItemNotFound, snapshot.ID, itemID)
+		}
+
+		item = latestItem
+		score, err = evaluateScoreWithProgram(snapshot.program, item.Data, item.UpdatedAt)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := lb.repo.MarkItemDirty(ctx, snapshot.ID, itemID, true); err != nil {
+		return nil, fmt.Errorf("mark realtime item dirty after mutation conflict: %w", err)
+	}
+	return nil, fmt.Errorf("%w: leaderboard_id=%s item_id=%s", ErrMutationConflict, snapshot.ID, itemID)
 }
 
 func (lb *Leaderboard) Recompute(ctx context.Context) error {

@@ -90,6 +90,81 @@ func UpdateItemHandler(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, http.StatusOK, response)
 }
 
+func MutateItemHandler(w http.ResponseWriter, r *http.Request) {
+	lbID := r.PathValue("id")
+	if lbID == "" {
+		sendError(w, http.StatusBadRequest, "leaderboard id is required")
+		return
+	}
+
+	lb, err := core.GetLeaderboard(r.Context(), lbID)
+	if err != nil {
+		if errors.Is(err, core.ErrLeaderboardNotFound) {
+			sendError(w, http.StatusNotFound, "leaderboard not found")
+			return
+		}
+		sendError(w, http.StatusInternalServerError, "failed to load leaderboard")
+		return
+	}
+
+	var req MutateItemRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		sendError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.ItemID == "" {
+		sendError(w, http.StatusBadRequest, "item_id is required")
+		return
+	}
+	if len(req.Ops) == 0 {
+		sendError(w, http.StatusBadRequest, "ops is required")
+		return
+	}
+
+	ops := make([]core.FieldMutation, len(req.Ops))
+	for i, op := range req.Ops {
+		if op.Field == "" {
+			sendError(w, http.StatusBadRequest, "field is required")
+			return
+		}
+		if op.Op != "inc" && op.Op != "dec" {
+			sendError(w, http.StatusBadRequest, "op must be inc or dec")
+			return
+		}
+		ops[i] = core.FieldMutation{
+			Field: op.Field,
+			Op:    op.Op,
+			Value: op.Value,
+		}
+	}
+
+	item, err := lb.MutateItem(r.Context(), req.ItemID, ops)
+	if err != nil {
+		switch {
+		case errors.Is(err, core.ErrItemNotFound):
+			sendError(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, core.ErrMutationConflict):
+			sendError(w, http.StatusConflict, err.Error())
+		default:
+			sendError(w, http.StatusBadRequest, "failed to mutate item: "+err.Error())
+		}
+		return
+	}
+
+	state := lb.State()
+	response := map[string]interface{}{
+		"item":           item,
+		"refresh_policy": state.RefreshPolicy,
+	}
+	if state.RefreshPolicy == core.RefreshPolicyScheduled {
+		response["status"] = "dirty"
+	} else {
+		response["status"] = "updated"
+	}
+
+	sendJSON(w, http.StatusOK, response)
+}
+
 func GetLeaderboardHandler(w http.ResponseWriter, r *http.Request) {
 	lbID := r.PathValue("id")
 	if lbID == "" {

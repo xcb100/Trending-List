@@ -11,6 +11,7 @@ const (
 	DurableOpLeaderboardUpsert = "leaderboard_upsert"
 	DurableOpLeaderboardDelete = "leaderboard_delete"
 	DurableOpItemUpsert        = "item_upsert"
+	DurableOpItemMutate        = "item_mutate"
 	DurableOpItemDelete        = "item_delete"
 )
 
@@ -37,6 +38,21 @@ type DurableItemPayload struct {
 	Score     *float64               `json:"score,omitempty"`
 	UpdatedAt time.Time              `json:"updated_at"`
 	IsDeleted bool                   `json:"is_deleted"`
+}
+
+type DurableItemMutationOp struct {
+	Field string  `json:"field"`
+	Op    string  `json:"op"`
+	Value float64 `json:"value"`
+}
+
+type DurableItemMutationPayload struct {
+	ItemID            string                  `json:"item_id"`
+	Ops               []DurableItemMutationOp `json:"ops"`
+	ExpectedUpdatedAt time.Time               `json:"expected_updated_at"`
+	Data              map[string]interface{}  `json:"data"`
+	Score             *float64                `json:"score,omitempty"`
+	UpdatedAt         time.Time               `json:"updated_at"`
 }
 
 type DurableStore interface {
@@ -127,5 +143,36 @@ func appendItemDeleteEvent(ctx context.Context, leaderboardID, itemID string) er
 		ItemID:        itemID,
 		Payload:       json.RawMessage(`{}`),
 		OccurredAt:    time.Now(),
+	})
+}
+
+func appendItemMutateEvent(ctx context.Context, leaderboardID, itemID string, ops []FieldMutation, expectedUpdatedAt time.Time, data map[string]interface{}, updatedAt time.Time, score *float64) error {
+	durableOps := make([]DurableItemMutationOp, len(ops))
+	for i, op := range ops {
+		durableOps[i] = DurableItemMutationOp{
+			Field: op.Field,
+			Op:    op.Op,
+			Value: op.Value,
+		}
+	}
+
+	payload, err := json.Marshal(DurableItemMutationPayload{
+		ItemID:            itemID,
+		Ops:               durableOps,
+		ExpectedUpdatedAt: expectedUpdatedAt,
+		Data:              cloneMap(data),
+		Score:             score,
+		UpdatedAt:         updatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal item mutate durable payload: %w", err)
+	}
+
+	return appendDurableEvent(ctx, DurableEvent{
+		Operation:     DurableOpItemMutate,
+		LeaderboardID: leaderboardID,
+		ItemID:        itemID,
+		Payload:       payload,
+		OccurredAt:    updatedAt,
 	})
 }

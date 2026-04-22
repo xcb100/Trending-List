@@ -95,10 +95,169 @@ func (r *RedisRepository) SaveItemData(ctx context.Context, lbID string, itemID 
 	return r.saveItemWithPayload(ctx, lbID, itemID, data, updatedAt)
 }
 
+const mutateItemScript = `
+local itemsKey = KEYS[1]
+local dirtyKey = KEYS[2]
+
+local itemID = ARGV[1]
+local expectedTS = ARGV[2]
+local newTS = ARGV[3]
+local markDirty = ARGV[4]
+local opCount = tonumber(ARGV[5])
+
+local payload = redis.call('HGET', itemsKey, itemID)
+if not payload then
+    return redis.error_reply('item_not_found')
+end
+
+local matchStr = '"updated_at":' .. expectedTS
+if not string.find(payload, matchStr, 1, true) then
+    return redis.error_reply('updated_at_mismatch')
+end
+
+local decoded = cjson.decode(payload)
+local data = decoded["data"]
+
+for i = 0, opCount - 1 do
+    local base = 6 + i * 3
+    local field = ARGV[base]
+    local op = ARGV[base + 1]
+    local value = tonumber(ARGV[base + 2])
+    local current = data[field]
+
+    if current == nil then
+        return redis.error_reply('field_not_found:' .. field)
+    end
+    if type(current) ~= 'number' then
+        return redis.error_reply('field_not_numeric:' .. field)
+    end
+
+    if op == 'inc' then
+        data[field] = current + value
+    elseif op == 'dec' then
+        data[field] = current - value
+    else
+        return redis.error_reply('invalid_op:' .. op)
+    end
+end
+
+decoded["updated_at"] = cjson.decode(newTS)
+local encoded = cjson.encode(decoded)
+redis.call('HSET', itemsKey, itemID, encoded)
+if markDirty == '1' then
+    redis.call('SADD', dirtyKey, itemID)
+end
+
+return encoded
+`
+
+func mutationRedisError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "item_not_found"):
+		return ErrItemNotFound
+	case strings.Contains(msg, "updated_at_mismatch"):
+		return ErrMutationConflict
+	default:
+		return err
+	}
+}
+
+func (r *RedisRepository) MutateItemData(ctx context.Context, lbID string, itemID string, ops []FieldMutation, expectedUpdatedAt time.Time, newUpdatedAt time.Time, markDirty bool) (*Item, error) {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	expectedJSON, err := expectedUpdatedAt.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("marshal expected updated_at for %s: %w", itemID, err)
+	}
+	newJSON, err := newUpdatedAt.MarshalJSON()
+	if err != nil {
+		return nil, fmt.Errorf("marshal new updated_at for %s: %w", itemID, err)
+	}
+
+	args := make([]interface{}, 0, 5+len(ops)*3)
+	dirtyFlag := "0"
+	if markDirty {
+		dirtyFlag = "1"
+	}
+	args = append(args, itemID, string(expectedJSON), string(newJSON), dirtyFlag, len(ops))
+	for _, op := range ops {
+		args = append(args, op.Field, op.Op, op.Value)
+	}
+
+	rawPayload, err := r.client.Eval(ctx, mutateItemScript, []string{r.itemsKey(lbID), r.dirtyKey(lbID)}, args...).Text()
+	if err != nil {
+		return nil, mutationRedisError(err)
+	}
+
+	var payload DataPayload
+	if err := json.Unmarshal([]byte(rawPayload), &payload); err != nil {
+		return nil, fmt.Errorf("decode mutated item payload for %s: %w", itemID, err)
+	}
+
+	score, err := r.client.ZScore(ctx, r.scoresKey(lbID), itemID).Result()
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	if err == redis.Nil {
+		score = 0
+	}
+
+	return &Item{
+		ID:        itemID,
+		Data:      payload.Data,
+		Score:     score,
+		UpdatedAt: payload.UpdatedAt,
+	}, nil
+}
+
 func (r *RedisRepository) UpdateItemScore(ctx context.Context, lbID string, itemID string, score float64) error {
 	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
 	defer cancel()
 	return r.client.ZAdd(ctx, r.scoresKey(lbID), redis.Z{Score: score, Member: itemID}).Err()
+}
+
+const commitMutatedRealtimeScoreScript = `
+local itemsKey = KEYS[1]
+local scoresKey = KEYS[2]
+local dirtyKey = KEYS[3]
+
+local itemID = ARGV[1]
+local score = tonumber(ARGV[2])
+local expectedTS = ARGV[3]
+
+local payload = redis.call('HGET', itemsKey, itemID)
+if not payload then
+    return redis.error_reply('item_not_found')
+end
+
+local matchStr = '"updated_at":' .. expectedTS
+if not string.find(payload, matchStr, 1, true) then
+    return redis.error_reply('updated_at_mismatch')
+end
+
+redis.call('ZADD', scoresKey, score, itemID)
+redis.call('SREM', dirtyKey, itemID)
+return 1
+`
+
+func (r *RedisRepository) CommitMutatedRealtimeScore(ctx context.Context, lbID string, itemID string, score float64, expectedUpdatedAt time.Time) error {
+	ctx, cancel := WithOperationTimeout(ctx, RedisRepositoryTimeout)
+	defer cancel()
+
+	rawJSON, err := expectedUpdatedAt.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("marshal updated_at for %s: %w", itemID, err)
+	}
+
+	if err := r.client.Eval(ctx, commitMutatedRealtimeScoreScript, []string{r.itemsKey(lbID), r.scoresKey(lbID), r.dirtyKey(lbID)}, itemID, score, string(rawJSON)).Err(); err != nil {
+		return mutationRedisError(err)
+	}
+	return nil
 }
 
 func (r *RedisRepository) UpsertItem(ctx context.Context, lbID string, itemID string, score float64, data map[string]interface{}, updatedAt time.Time) error {

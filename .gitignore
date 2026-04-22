@@ -10,6 +10,7 @@ vendor/
 .vscode/
 trendingList.exe
 .gocache/
+.gomodcache/
 .gotmp/
 AGENT.md
 **/AGENT.md
@@ -17,3 +18,7 @@ context.md
 CONTEXT.md
 **/context.md
 **/CONTEXT.md
+数据结构.md
+Redis Cluster改造方案.md
+字段级增量更新方案.md
+面试.md

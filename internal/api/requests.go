@@ -13,6 +13,17 @@ type UpdateItemRequest struct {
 	Data   map[string]interface{} `json:"data"`
 }
 
+type ItemMutationOp struct {
+	Field string  `json:"field"`
+	Op    string  `json:"op"`
+	Value float64 `json:"value"`
+}
+
+type MutateItemRequest struct {
+	ItemID string           `json:"item_id"`
+	Ops    []ItemMutationOp `json:"ops"`
+}
+
 type ScheduleUpdateRequest struct {
 	CronSpec string `json:"cron_spec"`
 }

@@ -16,6 +16,7 @@ func NewBusinessMux(readinessTimeout time.Duration, readinessCheck func(context.
 	mux.HandleFunc("GET /healthz", HealthHandler(readinessTimeout, readinessCheck))
 	mux.HandleFunc("POST /leaderboard", MetricsMiddleware("/leaderboard", CreateLeaderboardHandler))
 	mux.HandleFunc("POST /leaderboard/{id}/item", MetricsMiddleware("/leaderboard/{id}/item", UpdateItemHandler))
+	mux.HandleFunc("POST /leaderboard/{id}/item/mutate", MetricsMiddleware("/leaderboard/{id}/item/mutate", MutateItemHandler))
 	mux.HandleFunc("DELETE /leaderboard/{id}/item/{item_id}", MetricsMiddleware("/leaderboard/{id}/item/{item_id}", DeleteItemHandler))
 	mux.HandleFunc("GET /leaderboard/{id}", MetricsMiddleware("/leaderboard/{id}", GetLeaderboardHandler))
 	mux.HandleFunc("DELETE /leaderboard/{id}", MetricsMiddleware("/leaderboard/{id}", DeleteLeaderboardHandler))
